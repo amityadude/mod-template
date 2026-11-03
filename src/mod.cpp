@@ -1,12 +1,16 @@
-// Enemy Tactics v3 ("ruthless"): makes mobile enemies smarter and harder without touching their health.
+// Enemy Tactics v4 ("ruthless+"): makes mobile enemies smarter and harder without touching their health.
 //
 // Runs once per game tick from mod_update (no function hooks). 30 ticks = 1 second.
 //
 // Treatment per enemy (see kind_of):
-//   Adapter  (Bokoblin, Lizalfos, Dynalfos, Stalfos): full tactics. The mod switches the enemy's own
-//            actions (attack / draw back / wake up), so you get the game's real animations.
+//   Adapter  (Bokoblin, Lizalfos, Dynalfos, Stalfos, Bulblin): full tactics. The mod switches the
+//            enemy's own actions (attack / draw back / wake up), so you get the game's real animations.
 //   Generic  (27 other mobile enemies): movement rules only.
 //   Ignored  (all bosses, plants, statues, projectiles, water and wall enemies).
+//
+// New in v4: club Bulblins are adapters now, enemies strike in sync (pack attacks), faster telegraphs,
+// and the default numbers are harsher. For damage, use Dusklight's own Settings > Difficulty >
+// Damage Multiplier (1x-8x); it is a built-in setting, so this mod does not duplicate it.
 //
 // Every tunable number is in namespace cfg. Distances are game units (Link is ~100 tall).
 // All movement rules add up into one push per enemy per tick, capped at cfg::kMaxStep.
@@ -19,6 +23,7 @@
 #include "d/actor/d_a_e_dn.h"
 #include "d/actor/d_a_e_mf.h"
 #include "d/actor/d_a_e_oc.h"
+#include "d/actor/d_a_e_rd.h"
 #include "d/actor/d_a_e_sf.h"
 #include "d/d_com_inf_game.h"
 #include "f_op/f_op_actor_iter.h"
@@ -40,26 +45,26 @@ namespace cfg {
 constexpr float kEngageRange = 1500.0f;   // enemies farther than this from Link are ignored
 constexpr float kMovingSpeed = 1.0f;      // generic enemies count as "chasing" at |speedF| >= this
 constexpr float kIntensity = 1.0f;        // multiplies every movement step below (1.0 = as written)
-constexpr float kMaxStep = 14.0f;         // total extra movement per enemy per tick is capped here
+constexpr float kMaxStep = 16.0f;         // total extra movement per enemy per tick is capped here
 constexpr int kDesperationLife = 12;      // Link at or below this many life units (12 = 3 hearts)...
-constexpr float kDesperationBoost = 1.5f; // ...makes steps, chances and lunges this much stronger
+constexpr float kDesperationBoost = 1.6f; // ...makes steps, chances and lunges this much stronger
 
 // --- escalation: the longer a fight lasts, the harder they press
-constexpr int kEscalationStartTicks = 300;   // pressure starts rising after 10 s of fighting
+constexpr int kEscalationStartTicks = 240;   // pressure starts rising after 8 s of fighting
 constexpr int kEscalationFullTicks = 1800;   // and is at full strength after 60 s
-constexpr float kEscalationMax = 0.5f;       // +50% at full strength
+constexpr float kEscalationMax = 0.75f;      // +75% at full strength
 constexpr int kCalmResetTicks = 150;         // 5 s with nobody chasing resets it
 
 // --- speed: chasing enemies move this much faster (0.25 = +25%)
-constexpr float kSpeedBonus = 0.25f;
+constexpr float kSpeedBonus = 0.35f;
 
 // --- lunge: a short burst toward Link when he is at mid range
 constexpr float kLungeMinDist = 350.0f;
 constexpr float kLungeMaxDist = 800.0f;
 constexpr float kLungeStep = 12.0f;       // units per tick during a lunge
 constexpr int kLungeTicks = 8;
-constexpr float kLungeChance = 0.5f;      // checked once the cooldown is over
-constexpr int kLungeCooldown = 150;
+constexpr float kLungeChance = 0.65f;     // checked once the cooldown is over
+constexpr int kLungeCooldown = 120;
 
 // --- sense: idle fighters this close notice Link at once, no line of sight needed
 constexpr float kSenseRadius = 500.0f;
@@ -97,15 +102,15 @@ constexpr int kChargeCooldown = 150;
 // --- opening: your swing, roll or shield drop just ended -> they counter at once
 constexpr int kOpenWindow = 20;
 constexpr float kCounterRange = 330.0f;
-constexpr int kCounterCooldown = 120;
+constexpr int kCounterCooldown = 90;
 
 // --- you start a sword swing or a jump strike -> they dodge (draw back)
 constexpr float kDodgeRange = 280.0f;
-constexpr float kDodgeChance = 0.5f;
+constexpr float kDodgeChance = 0.65f;
 constexpr int kDodgeCooldown = 120;
 
 // --- hit and run: after their own attack ends they hop back out of your counter range
-constexpr float kRetreatChance = 0.4f;
+constexpr float kRetreatChance = 0.5f;
 constexpr float kRetreatMaxDist = 300.0f;
 constexpr int kRetreatCooldown = 90;
 
@@ -127,10 +132,24 @@ constexpr float kAlertMaxHeightDiff = 300.0f;
 // --- faster attacks and shorter stagger (adapter enemies)
 constexpr float kAttackAnimSpeed = 1.75f;  // 1.0 = vanilla speed
 constexpr float kStaggerAnimSpeed = 2.0f;
-constexpr short kAttackDecisionTimer = 8;  // Lizalfos/Stalfos attack timer is capped to this (vanilla 10-30)
+constexpr short kAttackDecisionTimer = 5;  // Lizalfos/Stalfos/Bulblin attack timer is capped to this (vanilla 10-40)
+
+// --- pack attacks: when one enemy starts a swing, nearby chasers follow up a moment later
+constexpr float kSyncTriggerDist = 450.0f;   // the first attacker must be this close to Link
+constexpr float kSyncRadius = 900.0f;        // chasers within this of Link may join
+constexpr float kSyncAttackRange = 420.0f;   // ...and must be this close to Link when they swing
+constexpr int kSyncMinDelay = 4;             // follow-up swings land 4..11 ticks after the first,
+constexpr int kSyncSpread = 8;               // so you cannot dodge them all with one roll
+constexpr float kSyncChance = 0.7f;          // each eligible chaser joins with this chance (x pressure)
+constexpr int kSyncCooldown = 100;           // per enemy
+
+// --- Bulblin (club, on foot): faster telegraph and recovery of their own swing
+constexpr short kBulblinWindup = 6;          // vanilla 15 ticks of wind-up
+constexpr short kBulblinRecover = 5;         // vanilla 15 ticks of recovery after the swing
+constexpr float kBulblinSwingFrameLimit = 50.0f;  // anim speed-up applies before this frame only
 }  // namespace cfg
 
-enum class Kind { None, Generic, Bokoblin, Lizalfos, Dynalfos, Stalfos };
+enum class Kind { None, Generic, Bokoblin, Lizalfos, Dynalfos, Stalfos, Bulblin };
 
 static Kind kind_of(fopAc_ac_c* a) {
     if (a->group != fopAc_ENEMY_e) {
@@ -141,6 +160,7 @@ static Kind kind_of(fopAc_ac_c* a) {
     case fpcNm_E_DN_e: return Kind::Lizalfos;
     case fpcNm_E_MF_e: return Kind::Dynalfos;
     case fpcNm_E_SF_e: return Kind::Stalfos;
+    case fpcNm_E_RD_e: return Kind::Bulblin;
     case fpcNm_E_AI_e:   // Armos
     case fpcNm_E_BA_e:   // Keese
     case fpcNm_E_BS_e:   // Stalkin
@@ -215,6 +235,17 @@ constexpr int DRAWBACK = 8;
 constexpr int S_DAMAGE = 20;
 }  // namespace sf
 
+namespace rd {  // src/d/actor/d_a_e_rd.cpp (Bulblin; ACTION_* and WEAPON_TYPE_* are file-local there)
+constexpr int NORMAL = 0;
+constexpr int FIGHT_RUN = 3;
+constexpr int FIGHT = 4;
+constexpr int AVOID = 10;
+constexpr int S_DAMAGE = 20;
+constexpr int DAMAGE = 21;
+constexpr int WEAPON_CLUB = 1;
+constexpr int RIDE_OFF = 0;
+}  // namespace rd
+
 struct EnemyMemory {
     int dodgeCd = 0;
     int chargeCd = 0;
@@ -223,6 +254,8 @@ struct EnemyMemory {
     int lungeTicks = 0;
     int retreatCd = 0;
     int wakeCd = 0;
+    int syncDelay = 0;  // >0: a pack attack is queued, counts down to a swing
+    int syncCd = 0;
     bool wasAttacking = false;
     float px = 0.0f;  // movement requested this tick (applied once, at the end)
     float pz = 0.0f;
@@ -275,6 +308,11 @@ static void add_push(EnemyMemory& m, float x, float z) {
     m.pz += z;
 }
 
+// Only club Bulblins on foot are adapted. Archers, riders and scripted ones are left to the game.
+static bool bulblin_on_foot_club(const e_rd_class* e) {
+    return e->weapon_type == rd::WEAPON_CLUB && e->ride_mode == rd::RIDE_OFF;
+}
+
 // True while the enemy is in its "run at Link" state, the safe moment to inject a new action.
 static bool is_chasing(Kind k, fopAc_ac_c* a) {
     switch (k) {
@@ -282,6 +320,13 @@ static bool is_chasing(Kind k, fopAc_ac_c* a) {
     case Kind::Lizalfos: return reinterpret_cast<e_dn_class*>(a)->action == dn::FIGHT_RUN;
     case Kind::Dynalfos: return reinterpret_cast<e_mf_class*>(a)->mAction == mf::FIGHT_RUN;
     case Kind::Stalfos: return reinterpret_cast<e_sf_class*>(a)->mAction == sf::FIGHT_RUN;
+    case Kind::Bulblin: {
+        // modes 1-3 = running / holding guard / backing up; modes < 0 are the arming animation and
+        // mode 5 is "stopped at a ledge", neither is a safe moment to push or inject anything.
+        auto* e = reinterpret_cast<e_rd_class*>(a);
+        return bulblin_on_foot_club(e) && e->action == rd::FIGHT_RUN && e->mode >= 1 && e->mode <= 3 &&
+               e->armament_flag == 0;
+    }
     case Kind::Generic: return std::fabs(a->speedF) >= cfg::kMovingSpeed;
     default: return false;
     }
@@ -302,6 +347,10 @@ static bool is_attacking(Kind k, fopAc_ac_c* a) {
     case Kind::Stalfos: {
         const int m = reinterpret_cast<e_sf_class*>(a)->mAction;
         return m == sf::ATTACK_0 || m == sf::ATTACK;
+    }
+    case Kind::Bulblin: {
+        auto* e = reinterpret_cast<e_rd_class*>(a);
+        return bulblin_on_foot_club(e) && e->action == rd::FIGHT;
     }
     default: return false;
     }
@@ -327,6 +376,10 @@ static bool is_fighting(Kind k, fopAc_ac_c* a) {
         const int m = reinterpret_cast<e_sf_class*>(a)->mAction;
         return m == sf::FIGHT_RUN || m == sf::ATTACK_0 || m == sf::ATTACK || m == sf::GUARD;
     }
+    case Kind::Bulblin: {
+        auto* e = reinterpret_cast<e_rd_class*>(a);
+        return bulblin_on_foot_club(e) && (e->action == rd::FIGHT_RUN || e->action == rd::FIGHT);
+    }
     default: return false;
     }
 }
@@ -341,12 +394,17 @@ static bool is_passive(Kind k, fopAc_ac_c* a) {
     case Kind::Lizalfos: return reinterpret_cast<e_dn_class*>(a)->action == dn::NORMAL;
     case Kind::Dynalfos: return reinterpret_cast<e_mf_class*>(a)->mAction == mf::NORMAL;
     case Kind::Stalfos: return reinterpret_cast<e_sf_class*>(a)->mAction == sf::NORMAL;
+    case Kind::Bulblin: {
+        // The game itself only looks for Link from NORMAL once mode >= 2 (modes 0-1 are set-up).
+        auto* e = reinterpret_cast<e_rd_class*>(a);
+        return bulblin_on_foot_club(e) && e->action == rd::NORMAL && e->mode >= 2;
+    }
     default: return false;
     }
 }
 
 static bool can_back_off(Kind k) {
-    return k == Kind::Lizalfos || k == Kind::Dynalfos || k == Kind::Stalfos;
+    return k == Kind::Lizalfos || k == Kind::Dynalfos || k == Kind::Stalfos || k == Kind::Bulblin;
 }
 
 static bool is_adapter(Kind k) {
@@ -383,6 +441,15 @@ static void wake_up(Kind k, fopAc_ac_c* a) {
         e->mActionPhase = 0;
         break;
     }
+    case Kind::Bulblin: {
+        // Same values e_rd_normal sets itself when it spots Link with a club.
+        auto* e = reinterpret_cast<e_rd_class*>(a);
+        e->action = rd::FIGHT_RUN;
+        e->mode = -10;
+        e->timer[0] = 60;
+        e->attack_timer = 35;
+        break;
+    }
     default: break;
     }
 }
@@ -417,6 +484,12 @@ static void start_attack(Kind k, fopAc_ac_c* a, float dist) {
         e->mActionPhase = 0;
         break;
     }
+    case Kind::Bulblin: {
+        auto* e = reinterpret_cast<e_rd_class*>(a);
+        e->action = rd::FIGHT;
+        e->mode = 0;
+        break;
+    }
     default: break;
     }
 }
@@ -441,6 +514,14 @@ static void start_back_off(Kind k, fopAc_ac_c* a) {
         e->mAction = sf::DRAWBACK;
         e->mActionPhase = 0;
         e->mInvulnerabilityTimer = 6;
+        break;
+    }
+    case Kind::Bulblin: {
+        // The game's own dodge hop (e_rd_avoid), set up exactly like its fight-run code does it.
+        auto* e = reinterpret_cast<e_rd_class*>(a);
+        e->action = rd::AVOID;
+        e->mode = 0;
+        e->damage_timer = 20;
         break;
     }
     default: break;
@@ -498,6 +579,29 @@ static void tune_reactions(Kind k, fopAc_ac_c* a) {
         }
         if (e->mAction == sf::FIGHT_RUN && e->mTimers[2] > cfg::kAttackDecisionTimer) {
             e->mTimers[2] = cfg::kAttackDecisionTimer;
+        }
+        break;
+    }
+    case Kind::Bulblin: {
+        auto* e = reinterpret_cast<e_rd_class*>(a);
+        if (!bulblin_on_foot_club(e)) {
+            break;
+        }
+        if (e->action == rd::FIGHT_RUN) {
+            e->attack_timer = 35;  // the game's "lost interest" counter never runs out near Link
+            if (e->timer[2] > cfg::kAttackDecisionTimer) {
+                e->timer[2] = cfg::kAttackDecisionTimer;  // vanilla 20-40 ticks between swings
+            }
+        } else if (e->action == rd::FIGHT) {
+            // mode 1 = wind-up, 2 = the swing itself, 3 = recovery (see e_rd_fight).
+            if (e->mode == 1 && e->timer[0] > cfg::kBulblinWindup) {
+                e->timer[0] = cfg::kBulblinWindup;
+            } else if (e->mode == 3 && e->timer[0] > cfg::kBulblinRecover) {
+                e->timer[0] = cfg::kBulblinRecover;
+            } else if (e->mode == 2 && e->anm_p && e->anm_p->getFrame() < cfg::kBulblinSwingFrameLimit) {
+                // Not in wind-up: that mode loops on an exact frame number and speed would skip it.
+                e->anm_p->setPlaySpeed(cfg::kAttackAnimSpeed);
+            }
         }
         break;
     }
@@ -651,6 +755,7 @@ static void tactics_tick() {
     }
 
     std::vector<Chaser> chasers;
+    bool packTrigger = false;  // somebody just began a swing at Link this tick
     for (fopAc_ac_c* a : engaged) {
         const Kind k = kind_of(a);
         EnemyMemory& m = g_memory[a];
@@ -661,12 +766,28 @@ static void tactics_tick() {
         if (m.counterCd > 0) m.counterCd--;
         if (m.lungeCd > 0) m.lungeCd--;
         if (m.retreatCd > 0) m.retreatCd--;
+        if (m.syncCd > 0) m.syncCd--;
 
         tune_reactions(k, a);
 
         const bool attacking = is_adapter(k) && is_attacking(k, a);
         const bool chasing = is_chasing(k, a);
         const float dist = dist_xz(a, plr);
+
+        // Pack attacks, part 1: note a fresh swing at Link (part 2 queues the followers after this loop).
+        if (attacking && !m.wasAttacking && dist < cfg::kSyncTriggerDist) {
+            packTrigger = true;
+            m.syncDelay = 0;  // the attacker itself is not a follower
+        }
+        // Part 3: a queued follow-up swing comes due. It is dropped if the moment has passed.
+        if (m.syncDelay > 0 && --m.syncDelay == 0) {
+            if (chasing && is_adapter(k) && dist < cfg::kSyncAttackRange) {
+                m.syncCd = cfg::kSyncCooldown;
+                m.wasAttacking = true;  // so this swing does not set off another pack trigger
+                start_attack(k, a, dist);
+                continue;
+            }
+        }
 
         // Hit and run: their attack just ended and they are back in chase mode, hop out of range.
         if (m.wasAttacking && !attacking && chasing && can_back_off(k) && m.retreatCd == 0 &&
@@ -774,6 +895,24 @@ static void tactics_tick() {
         }
     }
 
+    // Pack attacks, part 2: queue a delayed follow-up swing for every other ready chaser near Link.
+    if (packTrigger) {
+        for (fopAc_ac_c* a : engaged) {
+            const Kind k = kind_of(a);
+            EnemyMemory& m = g_memory[a];
+            if (!is_adapter(k) || m.syncDelay > 0 || m.syncCd > 0 || !is_chasing(k, a)) {
+                continue;
+            }
+            const float d = dist_xz(a, plr);
+            if (d >= cfg::kSyncRadius || d <= 1.0f) {
+                continue;
+            }
+            if (rand01() < std::min(1.0f, cfg::kSyncChance * press)) {
+                m.syncDelay = cfg::kSyncMinDelay + int(rand01() * float(cfg::kSyncSpread));
+            }
+        }
+    }
+
     // Surround: spread chasers evenly around Link, and pull the one nearest his back all the way behind.
     if (chasers.size() >= 2) {
         std::sort(chasers.begin(), chasers.end(),
@@ -846,7 +985,7 @@ static void tactics_tick() {
 
 extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError*) {
-    mods::log::info("enemy_tactics v3 initialized");
+    mods::log::info("enemy_tactics v4 initialized");
     return MOD_OK;
 }
 
