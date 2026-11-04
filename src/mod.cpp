@@ -1,4 +1,7 @@
-// Enemy Tactics v8 ("ruthless, but safe"): smarter and harder enemies, no extra health.
+// Enemy Tactics v9 ("ruthless, but safe"): smarter and harder enemies, no extra health.
+// v9: a status line goes to the in-game Logs window every 5 seconds while enemies are near, showing how
+//     many enemies the mod sees and how many times each tactic fired. If a line says "adapters=0", the
+//     mod does not recognise the enemy; if every counter stays 0 while you fight, tell me the line.
 // v8: idle enemies notice you from farther and check every tick, the "roar" pause after noticing you is
 //     short, and shielded enemies (Lizalfos, Dynalfos, Stalfos) raise their shield the moment you start a
 //     swing, jump strike or SHIELD BASH, hold it while you keep attacking, and recover faster when hit.
@@ -446,6 +449,12 @@ static bool g_prevSwinging = false;
 static bool g_prevRolling = false;
 static bool g_prevJumpStrike = false;
 static bool g_prevBash = false;
+struct Stats {
+    int guard = 0, dodge = 0, charge = 0, counter = 0, combo = 0, pack = 0, retreat = 0, lunge = 0, moved = 0;
+};
+static Stats g_stats;  // counts since the last status line
+static int g_statTicks = 0;
+static bool g_loggedFirstFight = false;
 static bool g_prevGuard = false;
 static int g_openWindow = 0;
 static int g_stillTicks = 0;
@@ -1191,6 +1200,7 @@ static void tactics_tick() {
                     m.syncCd = cfg::kSyncCooldown;
                     m.wasAttacking = true;  // so this swing does not set off another pack trigger
                     start_attack(k, a, dist);
+                    g_stats.pack++;
                     continue;
                 }
             }
@@ -1201,6 +1211,7 @@ static void tactics_tick() {
                 m.comboCd = cfg::kComboCooldown;
                 m.wasAttacking = true;  // the next tick sees "still attacking", not a fresh swing
                 start_attack(k, a, dist);
+                g_stats.combo++;
                 continue;
             }
 
@@ -1210,6 +1221,7 @@ static void tactics_tick() {
                 m.wasAttacking = false;
                 m.retreatCd = cfg::kRetreatCooldown;
                 start_back_off(k, a);
+                g_stats.retreat++;
                 continue;
             }
             m.wasAttacking = attacking;
@@ -1223,6 +1235,7 @@ static void tactics_tick() {
                     const float chance = bashStart ? cfg::kGuardBashChance : cfg::kGuardChance * myPress;
                     if (ex * fx + ez * fz > cfg::kGuardFacingCos && rand01() < std::min(1.0f, chance)) {
                         start_guard(k, a, jumpStart);
+                        g_stats.guard++;
                         m.guardCd = cfg::kGuardCooldown;
                         m.guardHold = 0;
                         continue;
@@ -1231,11 +1244,13 @@ static void tactics_tick() {
                 if (dodgeTrigger && can_back_off(k) && dist < cfg::kDodgeRange && m.dodgeCd == 0 &&
                     rand01() < std::min(1.0f, cfg::kDodgeChance * myPress)) {
                     start_back_off(k, a);
+                    g_stats.dodge++;
                     m.dodgeCd = cfg::kDodgeCooldown;
                     continue;
                 }
                 if (charging && dist < cfg::kChargeReactRange && m.chargeCd == 0) {
                     m.chargeCd = cfg::kChargeCooldown;
+                    g_stats.charge++;
                     if (can_back_off(k) && rand01() < 0.5f) {
                         start_back_off(k, a);
                     } else {
@@ -1245,6 +1260,7 @@ static void tactics_tick() {
                 }
                 if (g_openWindow > 0 && dist < cfg::kCounterRange && m.counterCd == 0) {
                     m.counterCd = cfg::kCounterCooldown;
+                    g_stats.counter++;
                     start_attack(k, a, dist);
                     continue;
                 }
@@ -1291,6 +1307,7 @@ static void tactics_tick() {
             m.lungeCd = cfg::kLungeCooldown;
             if (rand01() < std::min(1.0f, cfg::kLungeChance * myPress)) {
                 m.lungeTicks = cfg::kLungeTicks;
+                g_stats.lunge++;
             }
         }
 
@@ -1419,16 +1436,46 @@ static void tactics_tick() {
             }
             a->current.pos.x += ex;
             a->current.pos.z += ez;
+            g_stats.moved++;
         }
         m.haveLast = true;
         m.lastX = a->current.pos.x;
         m.lastZ = a->current.pos.z;
     }
+
+    // Status line (see the v9 note at the top). One line per 5 seconds while enemies are near.
+    if (!engaged.empty()) {
+        int nAdapters = 0;
+        int nChasing = 0;
+        for (fopAc_ac_c* a : engaged) {
+            const Kind k = kind_of(a);
+            if (is_adapter(k)) {
+                nAdapters++;
+                if (is_chasing(k, a)) {
+                    nChasing++;
+                }
+            }
+        }
+        if (!g_loggedFirstFight && nChasing > 0) {
+            g_loggedFirstFight = true;
+            mods::log::info("enemy_tactics: first chasing enemy seen, the tactics are running");
+        }
+        if (++g_statTicks >= 150) {
+            g_statTicks = 0;
+            mods::log::info(
+                "enemy_tactics: engaged={} adapters={} chasing={} | guard={} dodge={} counter={} combo={} "
+                "pack={} retreat={} charge={} lunge={} moved={} | pressure={:.2f}",
+                engaged.size(), nAdapters, nChasing, g_stats.guard, g_stats.dodge, g_stats.counter,
+                g_stats.combo, g_stats.pack, g_stats.retreat, g_stats.charge, g_stats.lunge, g_stats.moved,
+                press);
+            g_stats = Stats{};
+        }
+    }
 }
 
 extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError*) {
-    mods::log::info("enemy_tactics v8 initialized");
+    mods::log::info("enemy_tactics v9 initialized (status lines every 5 s while enemies are near)");
     return MOD_OK;
 }
 
@@ -1448,6 +1495,9 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_noHitTicks = 0;
     g_lastLife = 0x7fffffff;
     g_anyChaser = false;
+    g_stats = Stats{};
+    g_statTicks = 0;
+    g_loggedFirstFight = false;
     return MOD_OK;
 }
 }
