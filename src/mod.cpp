@@ -1,4 +1,9 @@
-// Enemy Tactics v7 ("ruthless, but safe"): smarter and harder enemies, no extra health.
+// Enemy Tactics v8 ("ruthless, but safe"): smarter and harder enemies, no extra health.
+// v8: idle enemies notice you from farther and check every tick, the "roar" pause after noticing you is
+//     short, and shielded enemies (Lizalfos, Dynalfos, Stalfos) raise their shield the moment you start a
+//     swing, jump strike or SHIELD BASH, hold it while you keep attacking, and recover faster when hit.
+//     (Why they were stunned "randomly": Stalfos never blocked shield bashes or left spins at all, and
+//     Dynalfos only blocked a bash on some animation frames. Both are fixed here.)
 // v7: enemies lead their target (cut you off when you run), chain a second swing, punish a jump strike
 //     landing, press harder the longer you go without being hit, and get angrier when badly hurt.
 // Timing: the game logic always runs 30 ticks per second, even if you play at 60+ fps with frame
@@ -147,6 +152,22 @@ constexpr int kSyncMinDelay = 4;             // follow-up swings start 4..11 tic
 constexpr int kSyncSpread = 8;
 constexpr float kSyncChance = 0.6f;          // per eligible chaser (x pressure)
 constexpr int kSyncCooldown = 120;           // per enemy
+
+// --- senses: idle enemies notice you sooner and react quicker (only their own range, check rate and timers)
+constexpr bool kEnableFastSense = true;
+constexpr float kNoticeRangeFloor = 900.0f;  // their own sight range is raised to at least this (0 = stays blind)
+constexpr bool kNoticeEveryTick = true;      // Lizalfos/Dynalfos/Stalfos look every tick instead of every 16th
+constexpr short kNoticeDelayTicks = 4;       // the pause after noticing you is capped to this (vanilla 15-25)
+
+// --- defense (Lizalfos, Dynalfos, Stalfos): shield up when you start a swing, jump strike or shield bash
+constexpr bool kEnableDefense = true;
+constexpr float kGuardChance = 0.8f;         // x pressure, for swings and jump strikes
+constexpr float kGuardBashChance = 1.0f;     // shield bashes are always answered
+constexpr float kGuardRange = 350.0f;
+constexpr float kGuardFacingCos = 0.3f;      // you must be facing them (1 = dead ahead)
+constexpr int kGuardCooldown = 60;           // per enemy; lower = harder to hit, 0 = always shielded
+constexpr int kGuardHoldMax = 75;            // keeps it up while you keep attacking, at most this long
+constexpr short kStaggerTicks = 8;           // Lizalfos/Dynalfos stagger is capped to this (vanilla 20)
 
 // --- combos: right after one of its own swings ends, an enemy may swing again if you are still in reach
 constexpr bool kEnableCombo = true;
@@ -401,6 +422,8 @@ struct EnemyMemory {
     int syncDelay = 0;         // > 0: a pack attack is queued and counts down to a swing
     int syncCd = 0;
     int comboCd = 0;
+    int guardCd = 0;
+    int guardHold = 0;
     int maxHealth = 0;         // the most health this enemy was seen with
     float boost = 1.0f;        // wounded boost, 1.0 when healthy
     float lead = 0.0f;         // radians to bend its step toward where Link is going
@@ -422,6 +445,7 @@ static std::unordered_set<int> g_seenProcs;
 static bool g_prevSwinging = false;
 static bool g_prevRolling = false;
 static bool g_prevJumpStrike = false;
+static bool g_prevBash = false;
 static bool g_prevGuard = false;
 static int g_openWindow = 0;
 static int g_stillTicks = 0;
@@ -722,6 +746,140 @@ static void tune_reactions(Kind k, fopAc_ac_c* a) {
     }
 }
 
+static bool can_guard(Kind k) {
+    return k == Kind::Lizalfos || k == Kind::Dynalfos || k == Kind::Stalfos;
+}
+
+// Shield up, set up exactly the way each enemy's own fight-run code does it (same fields, same values).
+// hop = the backward hop the game uses against a jump strike; otherwise it guards on the spot.
+static void start_guard(Kind k, fopAc_ac_c* a, bool hop) {
+    switch (k) {
+    case Kind::Lizalfos: {
+        auto* e = reinterpret_cast<e_dn_class*>(a);
+        e->action = dn::GUARD;
+        e->mode = hop ? 0 : 5;
+        e->field_0x708 = 30.0f;
+        e->field_0x70c = a->shape_angle.y;
+        e->timer[0] = 0;
+        e->invulnerability_timer = 15;
+        break;
+    }
+    case Kind::Dynalfos: {
+        auto* e = reinterpret_cast<e_mf_class*>(a);
+        e->mAction = mf::GUARD;
+        e->field_0x5b4 = hop ? 0 : 5;
+        e->field_0x6e8 = 30.0f;
+        e->field_0x6ec = a->shape_angle.y;
+        e->field_0x6c0[0] = 0;
+        e->field_0x6c8 = 15;
+        break;
+    }
+    case Kind::Stalfos: {
+        auto* e = reinterpret_cast<e_sf_class*>(a);
+        e->mAction = sf::GUARD;
+        e->mActionPhase = 0;
+        e->mTimers[0] = 0;
+        e->mInvulnerabilityTimer = 15;
+        break;
+    }
+    default: break;
+    }
+}
+
+static bool in_guard(Kind k, fopAc_ac_c* a) {
+    switch (k) {
+    case Kind::Lizalfos: return reinterpret_cast<e_dn_class*>(a)->action == dn::GUARD;
+    case Kind::Dynalfos: return reinterpret_cast<e_mf_class*>(a)->mAction == mf::GUARD;
+    case Kind::Stalfos: return reinterpret_cast<e_sf_class*>(a)->mAction == sf::GUARD;
+    default: return false;
+    }
+}
+
+// Keep the shield up a little longer (called every tick while you keep attacking). Lizalfos and Dynalfos
+// hold on a timer that we top up; the Stalfos drops its own guard the moment you pause, as in the game.
+static void extend_guard(Kind k, fopAc_ac_c* a) {
+    switch (k) {
+    case Kind::Lizalfos: {
+        auto* e = reinterpret_cast<e_dn_class*>(a);
+        if (e->mode == 7 && e->timer[0] < 6) {
+            e->timer[0] = 6;
+        }
+        break;
+    }
+    case Kind::Dynalfos: {
+        auto* e = reinterpret_cast<e_mf_class*>(a);
+        if (e->field_0x5b4 == 7 && e->field_0x6c0[0] < 6) {
+            e->field_0x6c0[0] = 6;
+        }
+        break;
+    }
+    default: break;
+    }
+}
+
+// Senses and reaction speed. Only their own sight range, check rate and wait timers are touched; the
+// game still decides with its own view cone and wall check whether it actually sees you.
+static void tune_awareness(Kind k, fopAc_ac_c* a) {
+    if (!cfg::kEnableFastSense) {
+        return;
+    }
+    switch (k) {
+    case Kind::Bokoblin: {
+        auto* e = reinterpret_cast<daE_OC_c*>(a);
+        if (e->mPlayerRange > 1.0f && e->mPlayerRange < cfg::kNoticeRangeFloor) {
+            e->mPlayerRange = cfg::kNoticeRangeFloor;
+        }
+        break;
+    }
+    case Kind::Lizalfos: {
+        auto* e = reinterpret_cast<e_dn_class*>(a);
+        if (e->pl_range > 1.0f && e->pl_range < cfg::kNoticeRangeFloor) {
+            e->pl_range = cfg::kNoticeRangeFloor;
+        }
+        if (cfg::kNoticeEveryTick && e->action == dn::NORMAL) {
+            e->frame_counter = e->frame_counter | 15;  // the game adds 1, landing on its "look now" tick
+        }
+        if (e->action == dn::FIGHT_RUN && e->mode == -9 && e->timer[1] > cfg::kNoticeDelayTicks) {
+            e->timer[1] = cfg::kNoticeDelayTicks;
+        }
+        if (e->action == dn::S_DAMAGE && e->mode == 1 && e->timer[0] > cfg::kStaggerTicks) {
+            e->timer[0] = cfg::kStaggerTicks;
+        }
+        break;
+    }
+    case Kind::Dynalfos: {
+        auto* e = reinterpret_cast<e_mf_class*>(a);
+        if (e->field_0x6b8 > 1.0f && e->field_0x6b8 < cfg::kNoticeRangeFloor) {
+            e->field_0x6b8 = cfg::kNoticeRangeFloor;
+        }
+        if (cfg::kNoticeEveryTick && e->mAction == mf::NORMAL) {
+            e->field_0x6ac = e->field_0x6ac | 15;
+        }
+        if (e->mAction == mf::FIGHT_RUN && e->field_0x5b4 == -9 && e->field_0x6c0[1] > cfg::kNoticeDelayTicks) {
+            e->field_0x6c0[1] = cfg::kNoticeDelayTicks;
+        }
+        if (e->mAction == mf::S_DAMAGE && e->field_0x5b4 == 1 && e->field_0x6c0[0] > cfg::kStaggerTicks) {
+            e->field_0x6c0[0] = cfg::kStaggerTicks;
+        }
+        break;
+    }
+    case Kind::Stalfos: {
+        auto* e = reinterpret_cast<e_sf_class*>(a);
+        if (e->mRecognizeDist > 1.0f && e->mRecognizeDist < cfg::kNoticeRangeFloor) {
+            e->mRecognizeDist = cfg::kNoticeRangeFloor;
+        }
+        if (cfg::kNoticeEveryTick && e->mAction == sf::NORMAL) {
+            e->mFrameCounter = e->mFrameCounter | 15;
+        }
+        if (e->mAction == sf::FIGHT_RUN && e->mActionPhase == -9 && e->mTimers[1] > cfg::kNoticeDelayTicks) {
+            e->mTimers[1] = cfg::kNoticeDelayTicks;
+        }
+        break;
+    }
+    default: break;
+    }
+}
+
 // Plants never move, so they only get a shorter wait before the next lunge.
 static void tune_plant(fopAc_ac_c* a, daPy_py_c* py, float dist, float dy) {
     if (!baba_ready(a) || baba_dk_caught(py) || dist > cfg::kPlantCounterRange ||
@@ -789,7 +947,7 @@ struct Chaser {
 };
 
 static void reset_player_state() {
-    g_prevSwinging = g_prevRolling = g_prevJumpStrike = g_prevGuard = false;
+    g_prevSwinging = g_prevRolling = g_prevJumpStrike = g_prevGuard = g_prevBash = false;
     g_havePrevPos = false;
 }
 
@@ -810,6 +968,7 @@ static void tactics_tick() {
     const bool rolling = py->checkFrontRoll();
     const bool jumpStrike = py->checkCutJumpMode();
     const u16 proc = link->mProcID;
+    const bool bashing = proc == daAlink_c::PROC_GUARD_ATTACK;  // Link's shield bash
     const bool ranged = proc == daAlink_c::PROC_BOW_SUBJECT || proc == daAlink_c::PROC_BOW_MOVE ||
                         proc == daAlink_c::PROC_BOOMERANG_SUBJECT ||
                         proc == daAlink_c::PROC_BOOMERANG_MOVE ||
@@ -868,7 +1027,11 @@ static void tactics_tick() {
     const float power = cfg::kIntensity * press;      // multiplies movement rules
 
     // Dodge triggers (rising edges) and counter window (falling edges of swing / roll / guard).
-    const bool dodgeTrigger = (swinging && !g_prevSwinging) || (jumpStrike && !g_prevJumpStrike);
+    const bool jumpStart = jumpStrike && !g_prevJumpStrike;
+    const bool dodgeTrigger = (swinging && !g_prevSwinging) || jumpStart;
+    const bool bashStart = bashing && !g_prevBash;
+    const bool guardTrigger = dodgeTrigger || bashStart;
+    const bool linkAttacking = swinging || jumpStrike || bashing;
     if ((!swinging && g_prevSwinging) || (!rolling && g_prevRolling) || (!guard && g_prevGuard) ||
         (!jumpStrike && g_prevJumpStrike)) {
         g_openWindow = cfg::kOpenWindow;
@@ -879,6 +1042,7 @@ static void tactics_tick() {
     g_prevRolling = rolling;
     g_prevJumpStrike = jumpStrike;
     g_prevGuard = guard;
+    g_prevBash = bashing;
 
     const float facing = plr->shape_angle.y * kAngleToRad;
     const float fx = std::sin(facing);  // Link's forward direction in the ground plane
@@ -966,6 +1130,7 @@ static void tactics_tick() {
         if (m.retreatCd > 0) m.retreatCd--;
         if (m.syncCd > 0) m.syncCd--;
         if (m.comboCd > 0) m.comboCd--;
+        if (m.guardCd > 0) m.guardCd--;
 
         const float dist = dist_xz(a, plr);
         const bool adapter = is_adapter(k);
@@ -998,6 +1163,19 @@ static void tactics_tick() {
         // ---- full-tactics enemies: use the enemy's own attack / back-off actions ----
         if (adapter) {
             tune_reactions(k, a);
+            tune_awareness(k, a);
+
+            // Defense: while the shield is up and you keep attacking, keep it up (it drops soon after you stop).
+            if (cfg::kEnableDefense && can_guard(k)) {
+                if (in_guard(k, a)) {
+                    if (linkAttacking && m.guardHold < cfg::kGuardHoldMax) {
+                        extend_guard(k, a);
+                        m.guardHold++;
+                    }
+                } else {
+                    m.guardHold = 0;
+                }
+            }
 
             const bool attacking = is_attacking(k, a);
             const bool chasing = is_chasing(k, a);
@@ -1037,6 +1215,19 @@ static void tactics_tick() {
             m.wasAttacking = attacking;
 
             if (chasing) {
+                // Shield: you started a swing, jump strike or bash and are facing it, so it raises its shield.
+                if (cfg::kEnableDefense && can_guard(k) && guardTrigger && m.guardCd == 0 &&
+                    dist < cfg::kGuardRange && dist > 1.0f) {
+                    const float ex = (a->current.pos.x - plr->current.pos.x) / dist;
+                    const float ez = (a->current.pos.z - plr->current.pos.z) / dist;
+                    const float chance = bashStart ? cfg::kGuardBashChance : cfg::kGuardChance * myPress;
+                    if (ex * fx + ez * fz > cfg::kGuardFacingCos && rand01() < std::min(1.0f, chance)) {
+                        start_guard(k, a, jumpStart);
+                        m.guardCd = cfg::kGuardCooldown;
+                        m.guardHold = 0;
+                        continue;
+                    }
+                }
                 if (dodgeTrigger && can_back_off(k) && dist < cfg::kDodgeRange && m.dodgeCd == 0 &&
                     rand01() < std::min(1.0f, cfg::kDodgeChance * myPress)) {
                     start_back_off(k, a);
@@ -1237,7 +1428,7 @@ static void tactics_tick() {
 
 extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError*) {
-    mods::log::info("enemy_tactics v7 initialized");
+    mods::log::info("enemy_tactics v8 initialized");
     return MOD_OK;
 }
 
