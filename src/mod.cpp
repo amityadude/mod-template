@@ -1,4 +1,11 @@
-// Enemy Tactics v5 ("ruthless, but safe"): smarter and harder enemies, no extra health.
+// Enemy Tactics v7 ("ruthless, but safe"): smarter and harder enemies, no extra health.
+// v7: enemies lead their target (cut you off when you run), chain a second swing, punish a jump strike
+//     landing, press harder the longer you go without being hit, and get angrier when badly hurt.
+// Timing: the game logic always runs 30 ticks per second, even if you play at 60+ fps with frame
+//     interpolation, so every "tick" number in cfg is real game time (30 ticks = 1 second).
+// v6: Darknuts are included (shorter gap between swings + the usual chase rules, only while chasing),
+//     Deku/Hebi Babas lunge sooner, Bulblins swing faster, and nearby fighters now strike in sync (pack
+//     attacks). The unused hook and evade/rooted leftovers from v5 were removed; nothing here edits health.
 // v5: every enemy actor was audited by name; Bulblins, Shadow Bulblins, Poes, Poison Mites and bees are now
 //     included (gently, with extra gates); newly found bosses and wall/segmented crawlers are excluded.
 //
@@ -17,13 +24,13 @@
 // 30 ticks = 1 second. All tunables are in namespace cfg.
 
 #include "mods/service.hpp"
-#include "mods/svc/hook.hpp"
 #include "mods/svc/log.hpp"
 
 // Game includes
 #include "SSystem/SComponent/c_cc_d.h"
 #include "SSystem/SComponent/c_cc_s.h"
 #include "d/actor/d_a_alink.h"
+#include "d/actor/d_a_b_tn.h"
 #include "d/actor/d_a_e_db.h"
 #include "d/actor/d_a_e_hb.h"
 #include "d/actor/d_a_e_dn.h"
@@ -46,10 +53,6 @@
 DEFINE_MOD();
 
 IMPORT_SERVICE(LogService, svc_log);
-IMPORT_SERVICE(HookService, svc_hook);
-
-// Called by the game for every confirmed overlap of an attack collider and a hurt collider.
-DEFINE_HOOK(&cCcS::SetAtTgCommonHitInf, AtTgHit);
 
 namespace cfg {
 // --- global
@@ -134,32 +137,65 @@ constexpr float kSenseRadius = 500.0f;
 constexpr float kSenseMaxHeightDiff = 200.0f;
 constexpr int kWakeCooldown = 30;
 
-// --- evade: an enemy that has noticed you lets some of your hits pass through it (the game's own hit
-// detection is told "no hit"; nothing about the enemy is modified)
-constexpr float kEvadeMelee = 0.30f;       // chance per sword swing / bash / spin / jump strike
-constexpr float kEvadeRanged = 0.20f;      // chance per arrow / boomerang
-constexpr float kEvadeMaxChance = 0.6f;    // cap after escalation and desperation boosts
-constexpr int kEvadeWindow = 12;           // ticks the whole swing passes through (0.4 s)
-constexpr int kEvadeCooldown = 90;         // an enemy cannot dodge twice within 3 s
-constexpr int kEvadeDecisionTicks = 20;    // one roll per attack, not one per tick of the swing
-constexpr int kComboWindow = 30;           // after one of your hits lands, 1 s with no dodging (combos work)
-constexpr float kEvadeAwareRange = 250.0f; // movement-only enemies count as aware inside this range or when chasing
-constexpr float kEvadeRootedRange = 350.0f;
+// --- pack attacks (Bokoblin, Lizalfos, Dynalfos, Stalfos): when one starts a swing at you, other chasers
+// nearby follow up a few ticks later with their own attack, so one roll does not dodge them all
+constexpr bool kEnablePackAttacks = true;
+constexpr float kSyncTriggerDist = 450.0f;   // the first attacker must be this close to Link
+constexpr float kSyncRadius = 900.0f;        // other chasers within this of Link may join
+constexpr float kSyncAttackRange = 420.0f;   // ...and must be this close when their swing starts
+constexpr int kSyncMinDelay = 4;             // follow-up swings start 4..11 ticks after the first
+constexpr int kSyncSpread = 8;
+constexpr float kSyncChance = 0.6f;          // per eligible chaser (x pressure)
+constexpr int kSyncCooldown = 120;           // per enemy
 
-// --- plants (Deku Baba, Hebi Baba): real counters using their own attack and hide actions
+// --- combos: right after one of its own swings ends, an enemy may swing again if you are still in reach
+constexpr bool kEnableCombo = true;
+constexpr float kComboChance = 0.35f;        // x pressure
+constexpr float kComboRange = 260.0f;
+constexpr int kComboCooldown = 75;           // per enemy, so it is at most one extra swing per ~2.5 s
+
+// --- leading: chasers aim at where you are going, not where you are (bends their own step)
+constexpr bool kEnableLead = true;
+constexpr float kLeadMinLinkSpeed = 2.0f;    // you must be moving at least this fast (units per tick)
+constexpr float kLeadMinDist = 150.0f;
+constexpr float kLeadMaxTicks = 15.0f;       // looks at most this far ahead (0.5 s)
+constexpr float kLeadMaxAngle = 0.7f;        // radians
+
+// --- adaptive: the longer a fight goes without you being hit, the harder they press
+constexpr bool kEnableAdaptive = true;
+constexpr int kAdaptiveStartTicks = 600;     // 20 s of fighting without being hit
+constexpr int kAdaptiveFullTicks = 2100;     // 70 s
+constexpr float kAdaptiveMax = 0.5f;         // +50% pressure at full strength; getting hit resets it
+
+// --- wounded: an enemy at or below this share of its own health is more aggressive (its health is not touched)
+constexpr bool kEnableWounded = true;
+constexpr float kWoundedFraction = 0.35f;
+constexpr float kWoundedBoost = 1.3f;
+
+// --- plants (Deku Baba, Hebi Baba): they lunge sooner (their own timer, their own lunge)
 constexpr float kPlantCounterRange = 500.0f;
 constexpr float kPlantMaxHeightDiff = 150.0f;
-constexpr short kPlantAttackTimer = 8;     // their attack timer is capped to this (vanilla 30-60)
-constexpr int kGuardWaitCooldown = 150;    // shield up: Lizalfos/Dynalfos/Stalfos back off and wait it out
+constexpr short kPlantAttackTimer = 8;       // wait before the next lunge is capped to this (vanilla 30-60)
+
+// --- Darknut (Temple of Time and the castle ones): the game's own attack cooldown is 120-350 ticks
+constexpr bool kEnableDarknut = true;
+constexpr int kDarknutAttackGap = 60;        // only while it is chasing; the game still picks the attack
+
+// --- Bulblin with a club, on foot (archers and riders are never touched by these)
+constexpr bool kEnableBulblinTimers = true;
+constexpr bool kBulblinNeverGiveUp = false;  // true: they never lose interest while you are near
+constexpr short kBulblinWindup = 8;          // vanilla 15 ticks of wind-up
+constexpr short kBulblinRecover = 6;         // vanilla 15 ticks of recovery after the swing
+constexpr float kBulblinSwingFrameLimit = 50.0f;  // swing speed-up applies before this animation frame only
 
 // --- faster attacks and shorter stagger (4 full-tactics enemies)
 constexpr float kAttackAnimSpeed = 1.5f;   // 1.0 = vanilla speed
 constexpr float kStaggerAnimSpeed = 2.0f;
-constexpr short kAttackDecisionTimer = 8;  // Lizalfos/Stalfos attack timer is capped to this (vanilla 10-30)
+constexpr short kAttackDecisionTimer = 6;  // Lizalfos/Stalfos/Bulblin attack timer is capped to this (vanilla 10-40)
 }  // namespace cfg
 
-// Plant = Deku Baba / Hebi Baba (real counters). Rooted = other rooted or wall enemies (dodge only, never moved).
-enum class Kind { None, Generic, Bokoblin, Lizalfos, Dynalfos, Stalfos, Plant, Rooted };
+// Plant = Deku Baba / Hebi Baba (timer only, they never move). Darknut = its own cooldown plus chase rules.
+enum class Kind { None, Generic, Bokoblin, Lizalfos, Dynalfos, Stalfos, Plant, Darknut };
 
 // Things that must not be touched. Every enemy actor in the game was checked by name (see the table in the
 // reply): bosses and mini-bosses, scripted fights, projectiles and props, plants that are rooted to the
@@ -200,7 +236,6 @@ static bool is_excluded(int prof) {
     case fpcNm_B_OB_e:
     case fpcNm_B_OH2_e:
     case fpcNm_B_OH_e:
-    case fpcNm_B_TN_e:
     case fpcNm_B_YOI_e:
     case fpcNm_B_YO_e:
     case fpcNm_B_ZANTM_e:
@@ -246,6 +281,7 @@ static float scale_of(int prof) {
     case fpcNm_E_PO_e:   // Poe
         return 0.6f;
     case fpcNm_E_BEE_e:  // Bee
+    case fpcNm_B_TN_e:   // Darknut (heavy and armored: gentler speed-up)
         return 0.5f;
     default: return 1.0f;
     }
@@ -257,6 +293,12 @@ static bool movement_ok(int prof, fopAc_ac_c* a) {
         // Only while a Bulblin is running at Link on foot (never while riding a boar, or in scripted states).
         const int act = reinterpret_cast<e_rd_class*>(a)->action;
         return act == 3 || act == 5;  // ACTION_FIGHT_RUN, ACTION_BOW_RUN
+    }
+    if (prof == fpcNm_B_TN_e) {
+        // Only while chasing: never in the entrance/transform cutscenes, attacks, guards or stagger.
+        auto* e = reinterpret_cast<daB_TN_c*>(a);
+        return !e->mInactive && !e->mDisappear &&
+               (e->mActionMode1 == daB_TN_c::ACT_CHASEH || e->mActionMode1 == daB_TN_c::ACT_CHASEL);
     }
     return true;
 }
@@ -279,26 +321,15 @@ static Kind kind_of(fopAc_ac_c* a) {
     case fpcNm_E_DB_e:   // Deku Baba
     case fpcNm_E_HB_e:   // Hebi Baba
         return Kind::Plant;
+    case fpcNm_B_TN_e:   // Darknut
+        return cfg::kEnableDarknut ? Kind::Darknut : Kind::None;
     case fpcNm_E_GB_e:   // Giant Baba
     case fpcNm_E_YD_e:   // Twilight Deku Baba
     case fpcNm_E_YH_e:   // Twilight Hebi Baba
     case fpcNm_E_WS_e:   // Wall Skulltula
     case fpcNm_E_SM_e:   // Chu Worm
-        return Kind::Rooted;
+        return Kind::None;  // rooted: nothing to speed up or steer
     default: return Kind::Generic;
-    }
-}
-
-// Types too big or too clumsy to dodge: they still get every other rule.
-static bool can_evade_type(int prof) {
-    switch (prof) {
-    case fpcNm_E_AI_e:   // Armos
-    case fpcNm_E_DD_e:   // Dodongo
-    case fpcNm_E_TH_e:   // Darkhammer
-    case fpcNm_E_FB_e:   // Freezard
-    case fpcNm_E_BEE_e:  // Bee
-        return false;
-    default: return true;
     }
 }
 
@@ -350,6 +381,13 @@ constexpr int DRAWBACK = 8;
 constexpr int S_DAMAGE = 20;
 }  // namespace sf
 
+namespace rd {  // src/d/actor/d_a_e_rd.cpp (Bulblin; these enums are file-local there)
+constexpr int FIGHT_RUN = 3;
+constexpr int FIGHT = 4;
+constexpr int WEAPON_CLUB = 1;
+constexpr int RIDE_OFF = 0;
+}  // namespace rd
+
 struct EnemyMemory {
     int dodgeCd = 0;
     int chargeCd = 0;
@@ -359,16 +397,13 @@ struct EnemyMemory {
     int retreatCd = 0;
     int wakeCd = 0;
     bool wasAttacking = false;
-    int guardCd = 0;
 
-    // evade (see on_at_tg_pre)
-    bool canEvade = false;     // aware of Link, evadable type
-    int evadeTicks = 0;        // > 0: your hits pass through this enemy
-    int evadeCd = 0;
-    int noEvadeTicks = 0;      // > 0: just got hit, no dodging
-    int decisionCd = 0;
-    bool pendingEvade = false; // a dodge just happened: play the enemy's own hop / hide
-    int awareTicks = 0;
+    int syncDelay = 0;         // > 0: a pack attack is queued and counts down to a swing
+    int syncCd = 0;
+    int comboCd = 0;
+    int maxHealth = 0;         // the most health this enemy was seen with
+    float boost = 1.0f;        // wounded boost, 1.0 when healthy
+    float lead = 0.0f;         // radians to bend its step toward where Link is going
 
     bool haveLast = false;  // position after our last edit, to measure the enemy's own step
     float lastX = 0.0f;
@@ -392,13 +427,13 @@ static int g_openWindow = 0;
 static int g_stillTicks = 0;
 static int g_fightTicks = 0;
 static int g_calmTicks = 0;
+static int g_noHitTicks = 0;
+static int g_lastLife = 0x7fffffff;
 static bool g_anyChaser = false;
 static bool g_havePrevPos = false;
 static float g_prevX = 0.0f;
 static float g_prevZ = 0.0f;
 static uint32_t g_rng = 0x2545F491u;
-static fopAc_ac_c* g_linkActor = nullptr;  // null while events run: no dodging then
-static float g_press = 1.0f;               // escalation * desperation, read by the hit hook
 
 constexpr float kPi = 3.14159265f;
 constexpr float kTwoPi = 6.28318531f;
@@ -687,6 +722,57 @@ static void tune_reactions(Kind k, fopAc_ac_c* a) {
     }
 }
 
+// Plants never move, so they only get a shorter wait before the next lunge.
+static void tune_plant(fopAc_ac_c* a, daPy_py_c* py, float dist, float dy) {
+    if (!baba_ready(a) || baba_dk_caught(py) || dist > cfg::kPlantCounterRange ||
+        dy > cfg::kPlantMaxHeightDiff) {
+        return;
+    }
+    const BabaView v = baba_of(a);
+    if (v.timers[1] > cfg::kPlantAttackTimer) {
+        v.timers[1] = cfg::kPlantAttackTimer;
+    }
+}
+
+// The Darknut decides its own attacks; its cooldown timer (mTimer3) is what makes it slow to repeat them.
+static void tune_darknut(fopAc_ac_c* a) {
+    auto* e = reinterpret_cast<daB_TN_c*>(a);
+    if (e->mInactive || e->mDisappear) {
+        return;
+    }
+    if (e->mActionMode1 == daB_TN_c::ACT_CHASEH || e->mActionMode1 == daB_TN_c::ACT_CHASEL) {
+        if (e->mTimer3 > cfg::kDarknutAttackGap) {
+            e->mTimer3 = cfg::kDarknutAttackGap;
+        }
+    }
+}
+
+// Club Bulblin on foot: faster telegraph, recovery and decision, using their own timers.
+static void tune_bulblin(fopAc_ac_c* a) {
+    auto* e = reinterpret_cast<e_rd_class*>(a);
+    if (e->weapon_type != rd::WEAPON_CLUB || e->ride_mode != rd::RIDE_OFF) {
+        return;
+    }
+    if (e->action == rd::FIGHT_RUN) {
+        if (cfg::kBulblinNeverGiveUp) {
+            e->attack_timer = 35;
+        }
+        if (e->timer[2] > cfg::kAttackDecisionTimer) {
+            e->timer[2] = cfg::kAttackDecisionTimer;
+        }
+    } else if (e->action == rd::FIGHT) {
+        // mode 1 = wind-up, 2 = the swing itself, 3 = recovery (see e_rd_fight).
+        if (e->mode == 1 && e->timer[0] > cfg::kBulblinWindup) {
+            e->timer[0] = cfg::kBulblinWindup;
+        } else if (e->mode == 3 && e->timer[0] > cfg::kBulblinRecover) {
+            e->timer[0] = cfg::kBulblinRecover;
+        } else if (e->mode == 2 && e->anm_p && e->anm_p->getFrame() < cfg::kBulblinSwingFrameLimit) {
+            // Not in wind-up: that mode loops on an exact frame number, which speed would skip.
+            e->anm_p->setPlaySpeed(cfg::kAttackAnimSpeed);
+        }
+    }
+}
+
 static int collect_enemies(void* actor, void* data) {
     auto* list = static_cast<std::vector<fopAc_ac_c*>*>(data);
     auto* a = static_cast<fopAc_ac_c*>(actor);
@@ -749,11 +835,18 @@ static void tactics_tick() {
     }
 
     // Escalation: the longer the fight lasts, the harder everyone presses.
+    const int lifeNow = dComIfGs_getLife();
+    if (lifeNow < g_lastLife) {
+        g_noHitTicks = 0;  // you got hit
+    }
+    g_lastLife = lifeNow;
     if (g_anyChaser) {
         g_fightTicks++;
+        g_noHitTicks++;
         g_calmTicks = 0;
     } else if (++g_calmTicks >= cfg::kCalmResetTicks) {
         g_fightTicks = 0;
+        g_noHitTicks = 0;
     }
     g_anyChaser = false;
     const float escalation =
@@ -764,12 +857,20 @@ static void tactics_tick() {
 
     // Desperation: Link is low on health, every enemy presses harder.
     const float boost = (dComIfGs_getLife() <= cfg::kDesperationLife) ? cfg::kDesperationBoost : 1.0f;
-    const float press = boost * (1.0f + escalation);  // multiplies chances
+    const float adaptive =
+        cfg::kEnableAdaptive
+            ? clampf(float(g_noHitTicks - cfg::kAdaptiveStartTicks) /
+                         float(cfg::kAdaptiveFullTicks - cfg::kAdaptiveStartTicks),
+                     0.0f, 1.0f) *
+                  cfg::kAdaptiveMax
+            : 0.0f;
+    const float press = boost * (1.0f + escalation + adaptive);  // multiplies chances
     const float power = cfg::kIntensity * press;      // multiplies movement rules
 
     // Dodge triggers (rising edges) and counter window (falling edges of swing / roll / guard).
     const bool dodgeTrigger = (swinging && !g_prevSwinging) || (jumpStrike && !g_prevJumpStrike);
-    if ((!swinging && g_prevSwinging) || (!rolling && g_prevRolling) || (!guard && g_prevGuard)) {
+    if ((!swinging && g_prevSwinging) || (!rolling && g_prevRolling) || (!guard && g_prevGuard) ||
+        (!jumpStrike && g_prevJumpStrike)) {
         g_openWindow = cfg::kOpenWindow;
     } else if (g_openWindow > 0) {
         g_openWindow--;
@@ -806,8 +907,12 @@ static void tactics_tick() {
 
         const int prof = fopAcM_GetProfName(a);
         if (g_seenProcs.insert(prof).second) {
+            const Kind lk = kind_of(a);
             mods::log::info("enemy_tactics: new enemy type, proc id {} ({})", prof,
-                            is_adapter(kind_of(a)) ? "full tactics" : "movement only");
+                            is_adapter(lk)            ? "full tactics"
+                            : lk == Kind::Plant       ? "plant timer"
+                            : lk == Kind::Darknut     ? "darknut"
+                                                      : "movement only");
         }
     }
     g_memory.swap(alive);
@@ -847,6 +952,7 @@ static void tactics_tick() {
     }
 
     std::vector<Chaser> chasers;
+    bool packTrigger = false;  // somebody just began a swing at Link this tick
     for (fopAc_ac_c* a : engaged) {
         const Kind k = kind_of(a);
         EnemyMemory& m = g_memory[a];
@@ -858,9 +964,36 @@ static void tactics_tick() {
         if (m.counterCd > 0) m.counterCd--;
         if (m.lungeCd > 0) m.lungeCd--;
         if (m.retreatCd > 0) m.retreatCd--;
+        if (m.syncCd > 0) m.syncCd--;
+        if (m.comboCd > 0) m.comboCd--;
 
         const float dist = dist_xz(a, plr);
         const bool adapter = is_adapter(k);
+        const int profId = fopAcM_GetProfName(a);
+
+        // Plants never move: timer only. Darknut and Bulblin: their own timers, then the movement rules.
+        if (k == Kind::Plant) {
+            tune_plant(a, py, dist, std::fabs(a->current.pos.y - plr->current.pos.y));
+            continue;
+        }
+        if (k == Kind::Darknut) {
+            tune_darknut(a);
+        } else if (cfg::kEnableBulblinTimers && profId == fpcNm_E_RD_e) {
+            tune_bulblin(a);
+        }
+
+        // Wounded: an enemy low on its own health presses harder (we only read health, never write it).
+        m.boost = 1.0f;
+        if (cfg::kEnableWounded) {
+            if (m.maxHealth <= 0 || a->health > m.maxHealth) {
+                m.maxHealth = a->health;
+            }
+            if (m.maxHealth >= 4 && a->health > 0 &&
+                float(a->health) <= cfg::kWoundedFraction * float(m.maxHealth)) {
+                m.boost = cfg::kWoundedBoost;
+            }
+        }
+        const float myPress = press * m.boost;
 
         // ---- full-tactics enemies: use the enemy's own attack / back-off actions ----
         if (adapter) {
@@ -869,9 +1002,33 @@ static void tactics_tick() {
             const bool attacking = is_attacking(k, a);
             const bool chasing = is_chasing(k, a);
 
+            // Pack attacks, part 1: note a fresh swing at Link (part 2 queues the followers after the
+            // loop); a queued follow-up that comes due now starts its own attack.
+            if (cfg::kEnablePackAttacks) {
+                if (attacking && !m.wasAttacking && dist < cfg::kSyncTriggerDist) {
+                    packTrigger = true;
+                    m.syncDelay = 0;  // the first attacker is not a follower
+                }
+                if (m.syncDelay > 0 && --m.syncDelay == 0 && chasing && dist < cfg::kSyncAttackRange) {
+                    m.syncCd = cfg::kSyncCooldown;
+                    m.wasAttacking = true;  // so this swing does not set off another pack trigger
+                    start_attack(k, a, dist);
+                    continue;
+                }
+            }
+
+            // Combo: their swing just ended, you are still in reach, so they swing again.
+            if (cfg::kEnableCombo && m.wasAttacking && !attacking && chasing && m.comboCd == 0 &&
+                dist < cfg::kComboRange && rand01() < std::min(1.0f, cfg::kComboChance * myPress)) {
+                m.comboCd = cfg::kComboCooldown;
+                m.wasAttacking = true;  // the next tick sees "still attacking", not a fresh swing
+                start_attack(k, a, dist);
+                continue;
+            }
+
             // Hit and run: their attack just ended and they are back in chase mode, hop out of range.
             if (m.wasAttacking && !attacking && chasing && can_back_off(k) && m.retreatCd == 0 &&
-                dist < cfg::kRetreatMaxDist && rand01() < std::min(1.0f, cfg::kRetreatChance * press)) {
+                dist < cfg::kRetreatMaxDist && rand01() < std::min(1.0f, cfg::kRetreatChance * myPress)) {
                 m.wasAttacking = false;
                 m.retreatCd = cfg::kRetreatCooldown;
                 start_back_off(k, a);
@@ -881,7 +1038,7 @@ static void tactics_tick() {
 
             if (chasing) {
                 if (dodgeTrigger && can_back_off(k) && dist < cfg::kDodgeRange && m.dodgeCd == 0 &&
-                    rand01() < std::min(1.0f, cfg::kDodgeChance * press)) {
+                    rand01() < std::min(1.0f, cfg::kDodgeChance * myPress)) {
                     start_back_off(k, a);
                     m.dodgeCd = cfg::kDodgeCooldown;
                     continue;
@@ -908,7 +1065,7 @@ static void tactics_tick() {
         }
 
         // ---- movement rules (all enemies): read the enemy's own step since we last looked ----
-        const int prof = fopAcM_GetProfName(a);
+        const int prof = profId;
         if (!m.haveLast || dist < 1.0f || !movement_ok(prof, a)) {
             continue;
         }
@@ -941,7 +1098,7 @@ static void tactics_tick() {
             k_speed += cfg::kLungeBonus;
         } else if (m.lungeCd == 0 && dist > cfg::kLungeMinDist && dist < cfg::kLungeMaxDist) {
             m.lungeCd = cfg::kLungeCooldown;
-            if (rand01() < std::min(1.0f, cfg::kLungeChance * press)) {
+            if (rand01() < std::min(1.0f, cfg::kLungeChance * myPress)) {
                 m.lungeTicks = cfg::kLungeTicks;
             }
         }
@@ -968,13 +1125,48 @@ static void tactics_tick() {
             steer = side * cfg::kAimAngle;
         }
 
+        // Leading: aim where Link will be when this enemy arrives, by bending its own step toward it.
+        float lead = 0.0f;
+        if (cfg::kEnableLead && lspeed >= cfg::kLeadMinLinkSpeed && dist > cfg::kLeadMinDist) {
+            const float t = std::min(cfg::kLeadMaxTicks, dist / std::max(step, 1.0f));
+            const float tx = plr->current.pos.x + vx * t - a->current.pos.x;
+            const float tz = plr->current.pos.z + vz * t - a->current.pos.z;
+            const float tl = std::sqrt(tx * tx + tz * tz);
+            if (tl > 1.0f) {
+                const float d1x = sx / step;
+                const float d1z = sz / step;
+                const float cross = d1x * (tz / tl) - d1z * (tx / tl);  // sin of the angle step -> intercept
+                const float dot = d1x * (tx / tl) + d1z * (tz / tl);
+                lead = clampf(std::atan2(cross, dot), -cfg::kLeadMaxAngle, cfg::kLeadMaxAngle);
+            }
+        }
+
         m.speedK = k_speed;
         m.steer = steer;
+        m.lead = lead;
 
         if (dist < cfg::kFlankRadius) {
             const float ddx = a->current.pos.x - plr->current.pos.x;
             const float ddz = a->current.pos.z - plr->current.pos.z;
             chasers.push_back({a, &m, std::atan2(ddz, ddx)});
+        }
+    }
+
+    // Pack attacks, part 2: queue a delayed follow-up swing for every other ready chaser near Link.
+    if (cfg::kEnablePackAttacks && packTrigger) {
+        for (fopAc_ac_c* a : engaged) {
+            const Kind k = kind_of(a);
+            EnemyMemory& m = g_memory[a];
+            if (!is_adapter(k) || m.syncDelay > 0 || m.syncCd > 0 || !is_chasing(k, a)) {
+                continue;
+            }
+            const float d = dist_xz(a, plr);
+            if (d >= cfg::kSyncRadius || d <= 1.0f) {
+                continue;
+            }
+            if (rand01() < std::min(1.0f, cfg::kSyncChance * press * m.boost)) {
+                m.syncDelay = cfg::kSyncMinDelay + int(rand01() * float(cfg::kSyncSpread));
+            }
         }
     }
 
@@ -1019,13 +1211,13 @@ static void tactics_tick() {
     for (fopAc_ac_c* a : engaged) {
         EnemyMemory& m = g_memory[a];
         if (m.active) {
-            const float theta = clampf(m.steer, -cfg::kMaxSteer, cfg::kMaxSteer);
+            const float theta = clampf(m.steer + m.lead, -cfg::kMaxSteer, cfg::kMaxSteer);
             const float c = std::cos(theta);
             const float s = std::sin(theta);
             // Own step, rotated by theta.
             const float rx = m.dx * c - m.dz * s;
             const float rz = m.dx * s + m.dz * c;
-            const float p = power * m.scale;
+            const float p = power * m.boost * m.scale;
             const float k = clampf(m.speedK * p, 0.0f, 2.0f);
             float ex = m.dx * k + (rx - m.dx) * cfg::kSteerStrength * p;
             float ez = m.dz * k + (rz - m.dz) * cfg::kSteerStrength * p;
@@ -1045,7 +1237,7 @@ static void tactics_tick() {
 
 extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError*) {
-    mods::log::info("enemy_tactics v5 initialized");
+    mods::log::info("enemy_tactics v7 initialized");
     return MOD_OK;
 }
 
@@ -1062,6 +1254,8 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_stillTicks = 0;
     g_fightTicks = 0;
     g_calmTicks = 0;
+    g_noHitTicks = 0;
+    g_lastLife = 0x7fffffff;
     g_anyChaser = false;
     return MOD_OK;
 }
