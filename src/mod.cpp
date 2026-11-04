@@ -1,25 +1,31 @@
-// Enemy Tactics v4 ("ruthless+"): makes mobile enemies smarter and harder without touching their health.
+// Enemy Tactics v5 ("ruthless, but safe"): smarter and harder enemies, no extra health.
+// v5: every enemy actor was audited by name; Bulblins, Shadow Bulblins, Poes, Poison Mites and bees are now
+//     included (gently, with extra gates); newly found bosses and wall/segmented crawlers are excluded.
 //
-// Runs once per game tick from mod_update (no function hooks). 30 ticks = 1 second.
+// What changed from v3 (v3 broke some enemies):
+//   * No more pushing enemies around. Every movement rule now only amplifies or bends the movement the enemy
+//     JUST made on its own (it already passed the game's own wall/floor collision). An enemy that is not
+//     moving toward you is never touched, so plants, statues, scripted enemies and knockbacks stay intact.
+//   * The Bokoblin "never gives up" leash edit, the Stalfos invulnerability write, and waking sleeping enemies
+//     are gone (waking is behind kEnableWake, off by default).
+//   * Every enemy in the "enemy" group is included, except the bosses, projectiles, mounted riders and scripted
+//     fight actors listed in is_excluded().
+//   * The first time each enemy type appears, the log prints its id, so a broken one can be named exactly.
 //
-// Treatment per enemy (see kind_of):
-//   Adapter  (Bokoblin, Lizalfos, Dynalfos, Stalfos, Bulblin): full tactics. The mod switches the
-//            enemy's own actions (attack / draw back / wake up), so you get the game's real animations.
-//   Generic  (27 other mobile enemies): movement rules only.
-//   Ignored  (all bosses, plants, statues, projectiles, water and wall enemies).
-//
-// New in v4: club Bulblins are adapters now, enemies strike in sync (pack attacks), faster telegraphs,
-// and the default numbers are harsher. For damage, use Dusklight's own Settings > Difficulty >
-// Damage Multiplier (1x-8x); it is a built-in setting, so this mod does not duplicate it.
-//
-// Every tunable number is in namespace cfg. Distances are game units (Link is ~100 tall).
-// All movement rules add up into one push per enemy per tick, capped at cfg::kMaxStep.
+// Full tactics (the enemy's own attack/back-off actions): Bokoblin, Lizalfos, Dynalfos, Stalfos.
+// Movement rules: every other included enemy.
+// 30 ticks = 1 second. All tunables are in namespace cfg.
 
 #include "mods/service.hpp"
+#include "mods/svc/hook.hpp"
 #include "mods/svc/log.hpp"
 
 // Game includes
+#include "SSystem/SComponent/c_cc_d.h"
+#include "SSystem/SComponent/c_cc_s.h"
 #include "d/actor/d_a_alink.h"
+#include "d/actor/d_a_e_db.h"
+#include "d/actor/d_a_e_hb.h"
 #include "d/actor/d_a_e_dn.h"
 #include "d/actor/d_a_e_mf.h"
 #include "d/actor/d_a_e_oc.h"
@@ -34,162 +40,265 @@
 #include <cmath>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 DEFINE_MOD();
 
 IMPORT_SERVICE(LogService, svc_log);
+IMPORT_SERVICE(HookService, svc_hook);
+
+// Called by the game for every confirmed overlap of an attack collider and a hurt collider.
+DEFINE_HOOK(&cCcS::SetAtTgCommonHitInf, AtTgHit);
 
 namespace cfg {
 // --- global
-constexpr float kEngageRange = 1500.0f;   // enemies farther than this from Link are ignored
-constexpr float kMovingSpeed = 1.0f;      // generic enemies count as "chasing" at |speedF| >= this
-constexpr float kIntensity = 1.0f;        // multiplies every movement step below (1.0 = as written)
-constexpr float kMaxStep = 16.0f;         // total extra movement per enemy per tick is capped here
-constexpr int kDesperationLife = 12;      // Link at or below this many life units (12 = 3 hearts)...
-constexpr float kDesperationBoost = 1.6f; // ...makes steps, chances and lunges this much stronger
+constexpr float kEngageRange = 1500.0f;    // enemies farther than this from Link are ignored
+constexpr float kIntensity = 1.0f;         // multiplies every movement rule (0.5 = half as strong)
+constexpr bool kEnableWake = false;        // true: idle Bokoblin/Lizalfos/Dynalfos/Stalfos notice Link (see v3)
+constexpr int kDesperationLife = 12;       // Link at or below this many life units (12 = 3 hearts)...
+constexpr float kDesperationBoost = 1.5f;  // ...makes every rule this much stronger
+
+// --- how movement rules read an enemy's own motion (units per tick)
+constexpr float kMinOwnStep = 0.8f;        // slower than this = standing still, never touched
+constexpr float kMaxOwnStep = 40.0f;       // faster than this = teleport / projectile, never touched
+constexpr float kTowardLinkDot = 0.4f;     // only enemies heading toward Link (within ~66 degrees) are touched
+constexpr float kMaxExtra = 8.0f;          // the most any rule set adds to one enemy in one tick
 
 // --- escalation: the longer a fight lasts, the harder they press
-constexpr int kEscalationStartTicks = 240;   // pressure starts rising after 8 s of fighting
-constexpr int kEscalationFullTicks = 1800;   // and is at full strength after 60 s
-constexpr float kEscalationMax = 0.75f;      // +75% at full strength
-constexpr int kCalmResetTicks = 150;         // 5 s with nobody chasing resets it
+constexpr int kEscalationStartTicks = 300; // starts after 10 s of fighting
+constexpr int kEscalationFullTicks = 1800; // full strength after 60 s
+constexpr float kEscalationMax = 0.5f;     // +50%
+constexpr int kCalmResetTicks = 150;       // 5 s with nobody chasing resets it
 
 // --- speed: chasing enemies move this much faster (0.25 = +25%)
-constexpr float kSpeedBonus = 0.35f;
+constexpr float kSpeedBonus = 0.25f;
 
-// --- lunge: a short burst toward Link when he is at mid range
+// --- lunge: short burst at mid range (their own movement doubled for a moment)
 constexpr float kLungeMinDist = 350.0f;
 constexpr float kLungeMaxDist = 800.0f;
-constexpr float kLungeStep = 12.0f;       // units per tick during a lunge
+constexpr float kLungeBonus = 1.0f;        // +100% movement during the burst
 constexpr int kLungeTicks = 8;
-constexpr float kLungeChance = 0.65f;     // checked once the cooldown is over
-constexpr int kLungeCooldown = 120;
+constexpr float kLungeChance = 0.5f;
+constexpr int kLungeCooldown = 150;
 
-// --- sense: idle fighters this close notice Link at once, no line of sight needed
-constexpr float kSenseRadius = 500.0f;
-constexpr float kSenseMaxHeightDiff = 200.0f;
-constexpr int kWakeCooldown = 30;
-
-// --- lead pursuit: while Link moves, enemies run to where he is going, not to where he was
-constexpr float kLeadTicks = 12.0f;
-constexpr float kLeadStep = 3.0f;
-constexpr float kLeadMinDist = 250.0f;
-
-// --- anti-flee: Link retreating (roll, backflip, run) makes them speed up after him
-constexpr float kFleeMinSpeed = 3.0f;     // Link must move at least this much per tick
-constexpr float kFleeMaxSpeed = 40.0f;    // faster than this (horse) is ignored
-constexpr float kFleeStep = 7.0f;
+// --- anti-flee: you retreat (roll, backflip, run) and they speed up after you
+constexpr float kFleeMinSpeed = 3.0f;
+constexpr float kFleeMaxSpeed = 40.0f;
+constexpr float kFleeBonus = 0.3f;
 constexpr float kFleeMinDist = 200.0f;
 constexpr float kFleeRange = 700.0f;
 
-// --- surround: 2+ chasers spread evenly around Link, one of them takes his back
-constexpr float kFlankRadius = 1000.0f;
-constexpr float kFlankStep = 4.0f;
-constexpr float kRearPull = 0.75f;        // extra push for the enemy nearest Link's back
-constexpr float kSpaceRadius = 160.0f;    // enemies closer than this to each other push apart
-constexpr float kSpaceStep = 3.0f;
+// --- you use a ranged item or stand still: they close in faster
+constexpr float kRangedBonus = 0.5f;
+constexpr float kPlayerStillSpeed = 1.0f;
+constexpr int kCampTicks = 60;
+constexpr float kCampBonus = 0.3f;
 
-// --- you hold your shield up -> they circle to your side
-constexpr float kCircleStep = 5.0f;
+// --- steering: how far an enemy's own heading is bent (radians), and how strongly it is applied
+constexpr float kSteerStrength = 0.6f;     // 0.6 * (rotated step - step)
+constexpr float kCircleAngle = 0.8f;       // shield up: circle to your side
 constexpr float kCircleMinDist = 150.0f;
 constexpr float kCircleMaxDist = 600.0f;
+constexpr float kAimCosine = 0.94f;        // ranged aim: enemy within 20 degrees of your aim strafes out
+constexpr float kAimRange = 1200.0f;
+constexpr float kAimAngle = 0.8f;
+constexpr float kFlankRadius = 1000.0f;    // 2+ chasers spread around you; one takes your back
+constexpr float kFlankAngle = 0.6f;
+constexpr float kRearPull = 0.75f;
+constexpr float kMaxSteer = 0.9f;
 
-// --- you charge a spin attack -> they interrupt (attack) or back off, 50/50
+// --- you charge a spin attack -> they interrupt (attack) or back off, 50/50 (4 full-tactics enemies)
 constexpr float kChargeReactRange = 450.0f;
 constexpr int kChargeCooldown = 150;
 
 // --- opening: your swing, roll or shield drop just ended -> they counter at once
 constexpr int kOpenWindow = 20;
 constexpr float kCounterRange = 330.0f;
-constexpr int kCounterCooldown = 90;
+constexpr int kCounterCooldown = 120;
 
-// --- you start a sword swing or a jump strike -> they dodge (draw back)
+// --- you start a sword swing or jump strike -> they dodge (back-hop)
 constexpr float kDodgeRange = 280.0f;
-constexpr float kDodgeChance = 0.65f;
+constexpr float kDodgeChance = 0.5f;
 constexpr int kDodgeCooldown = 120;
 
-// --- hit and run: after their own attack ends they hop back out of your counter range
-constexpr float kRetreatChance = 0.5f;
+// --- hit and run: after their own attack ends they hop out of your counter range
+constexpr float kRetreatChance = 0.3f;
 constexpr float kRetreatMaxDist = 300.0f;
 constexpr int kRetreatCooldown = 90;
 
-// --- you aim a ranged item: they strafe out of the line of fire and close in
-constexpr float kAimCosine = 0.94f;       // cos(20 degrees): enemy within 20 degrees of where you aim
-constexpr float kAimRange = 1200.0f;
-constexpr float kAimDodgeStep = 6.0f;
-
-// --- you stand still (ranged item or camping) -> they close the distance
-constexpr float kAdvanceStep = 6.0f;
-constexpr float kAdvanceMinDist = 350.0f;
-constexpr float kPlayerStillSpeed = 1.0f;
-constexpr int kCampTicks = 60;            // standing still this long counts as camping (half-speed advance)
-
-// --- group alert: one enemy fighting wakes idle enemies of the four adapter types nearby
+// --- group alert and sense (only when kEnableWake)
 constexpr float kAlertRadius = 1000.0f;
 constexpr float kAlertMaxHeightDiff = 300.0f;
+constexpr float kSenseRadius = 500.0f;
+constexpr float kSenseMaxHeightDiff = 200.0f;
+constexpr int kWakeCooldown = 30;
 
-// --- faster attacks and shorter stagger (adapter enemies)
-constexpr float kAttackAnimSpeed = 1.75f;  // 1.0 = vanilla speed
+// --- evade: an enemy that has noticed you lets some of your hits pass through it (the game's own hit
+// detection is told "no hit"; nothing about the enemy is modified)
+constexpr float kEvadeMelee = 0.30f;       // chance per sword swing / bash / spin / jump strike
+constexpr float kEvadeRanged = 0.20f;      // chance per arrow / boomerang
+constexpr float kEvadeMaxChance = 0.6f;    // cap after escalation and desperation boosts
+constexpr int kEvadeWindow = 12;           // ticks the whole swing passes through (0.4 s)
+constexpr int kEvadeCooldown = 90;         // an enemy cannot dodge twice within 3 s
+constexpr int kEvadeDecisionTicks = 20;    // one roll per attack, not one per tick of the swing
+constexpr int kComboWindow = 30;           // after one of your hits lands, 1 s with no dodging (combos work)
+constexpr float kEvadeAwareRange = 250.0f; // movement-only enemies count as aware inside this range or when chasing
+constexpr float kEvadeRootedRange = 350.0f;
+
+// --- plants (Deku Baba, Hebi Baba): real counters using their own attack and hide actions
+constexpr float kPlantCounterRange = 500.0f;
+constexpr float kPlantMaxHeightDiff = 150.0f;
+constexpr short kPlantAttackTimer = 8;     // their attack timer is capped to this (vanilla 30-60)
+constexpr int kGuardWaitCooldown = 150;    // shield up: Lizalfos/Dynalfos/Stalfos back off and wait it out
+
+// --- faster attacks and shorter stagger (4 full-tactics enemies)
+constexpr float kAttackAnimSpeed = 1.5f;   // 1.0 = vanilla speed
 constexpr float kStaggerAnimSpeed = 2.0f;
-constexpr short kAttackDecisionTimer = 5;  // Lizalfos/Stalfos/Bulblin attack timer is capped to this (vanilla 10-40)
-
-// --- pack attacks: when one enemy starts a swing, nearby chasers follow up a moment later
-constexpr float kSyncTriggerDist = 450.0f;   // the first attacker must be this close to Link
-constexpr float kSyncRadius = 900.0f;        // chasers within this of Link may join
-constexpr float kSyncAttackRange = 420.0f;   // ...and must be this close to Link when they swing
-constexpr int kSyncMinDelay = 4;             // follow-up swings land 4..11 ticks after the first,
-constexpr int kSyncSpread = 8;               // so you cannot dodge them all with one roll
-constexpr float kSyncChance = 0.7f;          // each eligible chaser joins with this chance (x pressure)
-constexpr int kSyncCooldown = 100;           // per enemy
-
-// --- Bulblin (club, on foot): faster telegraph and recovery of their own swing
-constexpr short kBulblinWindup = 6;          // vanilla 15 ticks of wind-up
-constexpr short kBulblinRecover = 5;         // vanilla 15 ticks of recovery after the swing
-constexpr float kBulblinSwingFrameLimit = 50.0f;  // anim speed-up applies before this frame only
+constexpr short kAttackDecisionTimer = 8;  // Lizalfos/Stalfos attack timer is capped to this (vanilla 10-30)
 }  // namespace cfg
 
-enum class Kind { None, Generic, Bokoblin, Lizalfos, Dynalfos, Stalfos, Bulblin };
+// Plant = Deku Baba / Hebi Baba (real counters). Rooted = other rooted or wall enemies (dodge only, never moved).
+enum class Kind { None, Generic, Bokoblin, Lizalfos, Dynalfos, Stalfos, Plant, Rooted };
+
+// Things that must not be touched. Every enemy actor in the game was checked by name (see the table in the
+// reply): bosses and mini-bosses, scripted fights, projectiles and props, plants that are rooted to the
+// ground, and enemies that crawl on walls, rails or segmented bodies, where moving only the head would tear
+// them apart.
+static bool is_excluded(int prof) {
+    switch (prof) {
+    // bosses, mini-bosses and boss parts
+    case fpcNm_E_GOB_e:      // Dangoro
+    case fpcNm_E_FM_e:       // Fyrus
+    case fpcNm_E_VT_e:       // Death Sword
+    case fpcNm_E_MK_e:       // Ook
+    case fpcNm_E_MK_BO_e:    // Ook's boomerang
+    case fpcNm_E_MB_e:       // Ook (Diababa fight)
+    case fpcNm_E_GM_e:       // Baby Gohma / Gohma Eye
+    case fpcNm_E_IS_e:       // Armos Titan
+    case fpcNm_E_FK_e:       // Phantom Rider
+    case fpcNm_E_HP_e:       // Huge Poe
+    case fpcNm_E_OctBg_e:    // Morpheel bomb fish
+    case fpcNm_E_YR_e:       // Twilight Kargorok rider
+    case fpcNm_E_FS_e:       // Wooden Puppet (Puppet Zelda fight)
+    // segmented / part actors
+    case fpcNm_E_SW_e:       // Moldorm
+    case fpcNm_E_MM_MT_e:    // Helmasaur shell part
+    case fpcNm_E_DF_e:       // Deku Flower
+    case fpcNm_E_GA_e:       // Decorative Moth
+    case fpcNm_B_BH_e:
+    case fpcNm_B_BQ_e:
+    case fpcNm_B_DRE_e:
+    case fpcNm_B_DR_e:
+    case fpcNm_B_DS_e:
+    case fpcNm_B_GG_e:
+    case fpcNm_B_GM_e:
+    case fpcNm_B_GND_e:
+    case fpcNm_B_GOS_e:
+    case fpcNm_B_GO_e:
+    case fpcNm_B_MGN_e:
+    case fpcNm_B_OB_e:
+    case fpcNm_B_OH2_e:
+    case fpcNm_B_OH_e:
+    case fpcNm_B_TN_e:
+    case fpcNm_B_YOI_e:
+    case fpcNm_B_YO_e:
+    case fpcNm_B_ZANTM_e:
+    case fpcNm_B_ZANTS_e:
+    case fpcNm_B_ZANTZ_e:
+    case fpcNm_B_ZANT_e:
+    // projectiles, eggs, leaves, lines, balls, tags
+    case fpcNm_E_ARROW_e:
+    case fpcNm_E_BI_LEAF_e:
+    case fpcNm_E_DB_LEAF_e:
+    case fpcNm_E_HB_LEAF_e:
+    case fpcNm_E_YD_LEAF_e:
+    case fpcNm_E_CR_EGG_e:
+    case fpcNm_E_NEST_e:
+    case fpcNm_E_ST_LINE_e:
+    case fpcNm_E_TH_BALL_e:
+    case fpcNm_E_TK_BALL_e:
+    case fpcNm_E_YM_TAG_e:
+    case fpcNm_E_WAP_e:
+    // King Bulblin and the boar (Bulblin riders E_RD and Shadow Bulblins E_RDY are included, see scale_of)
+    case fpcNm_E_RDB_e:
+    case fpcNm_E_WB_e:
+    // scripted fight actors
+    case fpcNm_E_HZELDA_e:
+    case fpcNm_E_PM_e:
+    case fpcNm_E_PZ_e:
+    case fpcNm_E_ZM_e:
+    case fpcNm_E_ZH_e:
+    case fpcNm_E_MD_e:
+    case fpcNm_E_YM_e:
+    case fpcNm_E_YMB_e:
+        return true;
+    default: return false;
+    }
+}
+
+// How strongly the movement rules apply to an enemy type (1.0 = as written). Bulblins, Poes and bees are
+// included but gentler, because they are mounted, phase in and out, or come in swarms.
+static float scale_of(int prof) {
+    switch (prof) {
+    case fpcNm_E_RD_e:   // Bulblin
+    case fpcNm_E_RDY_e:  // Shadow Bulblin
+    case fpcNm_E_PO_e:   // Poe
+        return 0.6f;
+    case fpcNm_E_BEE_e:  // Bee
+        return 0.5f;
+    default: return 1.0f;
+    }
+}
+
+// Extra per-type gate on when the movement rules may touch an enemy.
+static bool movement_ok(int prof, fopAc_ac_c* a) {
+    if (prof == fpcNm_E_RD_e) {
+        // Only while a Bulblin is running at Link on foot (never while riding a boar, or in scripted states).
+        const int act = reinterpret_cast<e_rd_class*>(a)->action;
+        return act == 3 || act == 5;  // ACTION_FIGHT_RUN, ACTION_BOW_RUN
+    }
+    return true;
+}
 
 static Kind kind_of(fopAc_ac_c* a) {
-    if (a->group != fopAc_ENEMY_e) {
+    const int prof = fopAcM_GetProfName(a);
+    // Poison Mites and bees are not in the game's "enemy" group, but they are enemies.
+    const bool actorGroupEnemy = a->group == fopAc_ACTOR_e && (prof == fpcNm_E_BUG_e || prof == fpcNm_E_BEE_e);
+    if (a->group != fopAc_ENEMY_e && !actorGroupEnemy) {
         return Kind::None;
     }
-    switch (fopAcM_GetProfName(a)) {
+    if (is_excluded(prof)) {
+        return Kind::None;
+    }
+    switch (prof) {
     case fpcNm_E_OC_e: return Kind::Bokoblin;
     case fpcNm_E_DN_e: return Kind::Lizalfos;
     case fpcNm_E_MF_e: return Kind::Dynalfos;
     case fpcNm_E_SF_e: return Kind::Stalfos;
-    case fpcNm_E_RD_e: return Kind::Bulblin;
+    case fpcNm_E_DB_e:   // Deku Baba
+    case fpcNm_E_HB_e:   // Hebi Baba
+        return Kind::Plant;
+    case fpcNm_E_GB_e:   // Giant Baba
+    case fpcNm_E_YD_e:   // Twilight Deku Baba
+    case fpcNm_E_YH_e:   // Twilight Hebi Baba
+    case fpcNm_E_WS_e:   // Wall Skulltula
+    case fpcNm_E_SM_e:   // Chu Worm
+        return Kind::Rooted;
+    default: return Kind::Generic;
+    }
+}
+
+// Types too big or too clumsy to dodge: they still get every other rule.
+static bool can_evade_type(int prof) {
+    switch (prof) {
     case fpcNm_E_AI_e:   // Armos
-    case fpcNm_E_BA_e:   // Keese
-    case fpcNm_E_BS_e:   // Stalkin
-    case fpcNm_E_BU_e:   // Bubble
-    case fpcNm_E_BUG_e:  // Poison Mite
-    case fpcNm_E_CR_e:   // Bombskit
     case fpcNm_E_DD_e:   // Dodongo
-    case fpcNm_E_DK_e:   // Bari
-    case fpcNm_E_GE_e:   // Guay
-    case fpcNm_E_GI_e:   // Gibdo
-    case fpcNm_E_GS_e:   // Ghost Soldier
-    case fpcNm_E_HM_e:   // Torch Slug
-    case fpcNm_E_KK_e:   // Chilfos
-    case fpcNm_E_KR_e:   // Kargorok
-    case fpcNm_E_MM_e:   // Helmasaur
-    case fpcNm_E_NZ_e:   // Ghoul Rat
-    case fpcNm_E_PH_e:   // Peahat
-    case fpcNm_E_RB_e:   // Leever
-    case fpcNm_E_S1_e:   // Shadow Beast
-    case fpcNm_E_SH_e:   // Stalhound
-    case fpcNm_E_SM2_e:  // Chuchu
     case fpcNm_E_TH_e:   // Darkhammer
-    case fpcNm_E_TT_e:   // Tektite
-    case fpcNm_E_WW_e:   // White Wolfos
-    case fpcNm_E_YC_e:   // Twilight Kargorok
-    case fpcNm_E_YK_e:   // Shadow Keese
-    case fpcNm_E_ZS_e:   // Staltroop
-        return Kind::Generic;
-    default: return Kind::None;
+    case fpcNm_E_FB_e:   // Freezard
+    case fpcNm_E_BEE_e:  // Bee
+        return false;
+    default: return true;
     }
 }
 
@@ -225,6 +334,12 @@ constexpr int DRAWBACK = 12;
 constexpr int S_DAMAGE = 20;
 constexpr int DAMAGE = 21;
 }  // namespace mf
+namespace baba {  // src/d/actor/d_a_e_db.cpp and d_a_e_hb.cpp (Deku Baba, Hebi Baba share these)
+constexpr int STAY = 0;    // hidden / hiding (mode 2 = start hiding)
+constexpr int WAIT = 3;    // swaying; mode 1 = ready to attack
+constexpr int ATTACK = 4;  // lunge (mode 0 = start)
+constexpr int CHANCE = 6;
+}  // namespace baba
 namespace sf {  // src/d/actor/d_a_e_sf.cpp (Stalfos)
 constexpr int NORMAL = 0;
 constexpr int FIGHT_RUN = 3;
@@ -235,17 +350,6 @@ constexpr int DRAWBACK = 8;
 constexpr int S_DAMAGE = 20;
 }  // namespace sf
 
-namespace rd {  // src/d/actor/d_a_e_rd.cpp (Bulblin; ACTION_* and WEAPON_TYPE_* are file-local there)
-constexpr int NORMAL = 0;
-constexpr int FIGHT_RUN = 3;
-constexpr int FIGHT = 4;
-constexpr int AVOID = 10;
-constexpr int S_DAMAGE = 20;
-constexpr int DAMAGE = 21;
-constexpr int WEAPON_CLUB = 1;
-constexpr int RIDE_OFF = 0;
-}  // namespace rd
-
 struct EnemyMemory {
     int dodgeCd = 0;
     int chargeCd = 0;
@@ -254,14 +358,32 @@ struct EnemyMemory {
     int lungeTicks = 0;
     int retreatCd = 0;
     int wakeCd = 0;
-    int syncDelay = 0;  // >0: a pack attack is queued, counts down to a swing
-    int syncCd = 0;
     bool wasAttacking = false;
-    float px = 0.0f;  // movement requested this tick (applied once, at the end)
-    float pz = 0.0f;
+    int guardCd = 0;
+
+    // evade (see on_at_tg_pre)
+    bool canEvade = false;     // aware of Link, evadable type
+    int evadeTicks = 0;        // > 0: your hits pass through this enemy
+    int evadeCd = 0;
+    int noEvadeTicks = 0;      // > 0: just got hit, no dodging
+    int decisionCd = 0;
+    bool pendingEvade = false; // a dodge just happened: play the enemy's own hop / hide
+    int awareTicks = 0;
+
+    bool haveLast = false;  // position after our last edit, to measure the enemy's own step
+    float lastX = 0.0f;
+    float lastZ = 0.0f;
+
+    bool active = false;    // this tick: moving toward Link on its own, so movement rules apply
+    float dx = 0.0f;        // its own step this tick
+    float dz = 0.0f;
+    float scale = 1.0f;     // per-type strength (see scale_of)
+    float speedK = 0.0f;    // extra fraction of that step to add
+    float steer = 0.0f;     // radians to bend that step
 };
 
 static std::unordered_map<const void*, EnemyMemory> g_memory;
+static std::unordered_set<int> g_seenProcs;
 static bool g_prevSwinging = false;
 static bool g_prevRolling = false;
 static bool g_prevJumpStrike = false;
@@ -275,6 +397,8 @@ static bool g_havePrevPos = false;
 static float g_prevX = 0.0f;
 static float g_prevZ = 0.0f;
 static uint32_t g_rng = 0x2545F491u;
+static fopAc_ac_c* g_linkActor = nullptr;  // null while events run: no dodging then
+static float g_press = 1.0f;               // escalation * desperation, read by the hit hook
 
 constexpr float kPi = 3.14159265f;
 constexpr float kTwoPi = 6.28318531f;
@@ -303,16 +427,6 @@ static float dist_xz(const fopAc_ac_c* a, const fopAc_ac_c* b) {
     return std::sqrt(dx * dx + dz * dz);
 }
 
-static void add_push(EnemyMemory& m, float x, float z) {
-    m.px += x;
-    m.pz += z;
-}
-
-// Only club Bulblins on foot are adapted. Archers, riders and scripted ones are left to the game.
-static bool bulblin_on_foot_club(const e_rd_class* e) {
-    return e->weapon_type == rd::WEAPON_CLUB && e->ride_mode == rd::RIDE_OFF;
-}
-
 // True while the enemy is in its "run at Link" state, the safe moment to inject a new action.
 static bool is_chasing(Kind k, fopAc_ac_c* a) {
     switch (k) {
@@ -320,14 +434,6 @@ static bool is_chasing(Kind k, fopAc_ac_c* a) {
     case Kind::Lizalfos: return reinterpret_cast<e_dn_class*>(a)->action == dn::FIGHT_RUN;
     case Kind::Dynalfos: return reinterpret_cast<e_mf_class*>(a)->mAction == mf::FIGHT_RUN;
     case Kind::Stalfos: return reinterpret_cast<e_sf_class*>(a)->mAction == sf::FIGHT_RUN;
-    case Kind::Bulblin: {
-        // modes 1-3 = running / holding guard / backing up; modes < 0 are the arming animation and
-        // mode 5 is "stopped at a ledge", neither is a safe moment to push or inject anything.
-        auto* e = reinterpret_cast<e_rd_class*>(a);
-        return bulblin_on_foot_club(e) && e->action == rd::FIGHT_RUN && e->mode >= 1 && e->mode <= 3 &&
-               e->armament_flag == 0;
-    }
-    case Kind::Generic: return std::fabs(a->speedF) >= cfg::kMovingSpeed;
     default: return false;
     }
 }
@@ -347,10 +453,6 @@ static bool is_attacking(Kind k, fopAc_ac_c* a) {
     case Kind::Stalfos: {
         const int m = reinterpret_cast<e_sf_class*>(a)->mAction;
         return m == sf::ATTACK_0 || m == sf::ATTACK;
-    }
-    case Kind::Bulblin: {
-        auto* e = reinterpret_cast<e_rd_class*>(a);
-        return bulblin_on_foot_club(e) && e->action == rd::FIGHT;
     }
     default: return false;
     }
@@ -376,15 +478,11 @@ static bool is_fighting(Kind k, fopAc_ac_c* a) {
         const int m = reinterpret_cast<e_sf_class*>(a)->mAction;
         return m == sf::FIGHT_RUN || m == sf::ATTACK_0 || m == sf::ATTACK || m == sf::GUARD;
     }
-    case Kind::Bulblin: {
-        auto* e = reinterpret_cast<e_rd_class*>(a);
-        return bulblin_on_foot_club(e) && (e->action == rd::FIGHT_RUN || e->action == rd::FIGHT);
-    }
     default: return false;
     }
 }
 
-// Idle (not yet fighting) and safe to wake. Scripted/demo/sleeping states are not included.
+// Idle (not yet fighting). Only used when kEnableWake is on.
 static bool is_passive(Kind k, fopAc_ac_c* a) {
     switch (k) {
     case Kind::Bokoblin: {
@@ -394,21 +492,49 @@ static bool is_passive(Kind k, fopAc_ac_c* a) {
     case Kind::Lizalfos: return reinterpret_cast<e_dn_class*>(a)->action == dn::NORMAL;
     case Kind::Dynalfos: return reinterpret_cast<e_mf_class*>(a)->mAction == mf::NORMAL;
     case Kind::Stalfos: return reinterpret_cast<e_sf_class*>(a)->mAction == sf::NORMAL;
-    case Kind::Bulblin: {
-        // The game itself only looks for Link from NORMAL once mode >= 2 (modes 0-1 are set-up).
-        auto* e = reinterpret_cast<e_rd_class*>(a);
-        return bulblin_on_foot_club(e) && e->action == rd::NORMAL && e->mode >= 2;
-    }
     default: return false;
     }
 }
 
 static bool can_back_off(Kind k) {
-    return k == Kind::Lizalfos || k == Kind::Dynalfos || k == Kind::Stalfos || k == Kind::Bulblin;
+    return k == Kind::Lizalfos || k == Kind::Dynalfos || k == Kind::Stalfos;
 }
 
+// The four enemies with full action-level tactics.
 static bool is_adapter(Kind k) {
-    return k != Kind::None && k != Kind::Generic;
+    return k == Kind::Bokoblin || k == Kind::Lizalfos || k == Kind::Dynalfos || k == Kind::Stalfos;
+}
+
+// Deku Baba / Hebi Baba share this layout; both are plain structs starting with the enemy base.
+struct BabaView {
+    s16* action;
+    s16* mode;
+    s16* timers;  // timers[1] counts down to the next attack
+};
+
+static BabaView baba_of(fopAc_ac_c* a) {
+    if (fopAcM_GetProfName(a) == fpcNm_E_DB_e) {
+        auto* e = reinterpret_cast<e_db_class*>(a);
+        return {&e->action, &e->mode, e->timers};
+    }
+    auto* e = reinterpret_cast<e_hb_class*>(a);
+    return {&e->action, &e->mode, e->timers};
+}
+
+// Swaying and ready to attack: the only state we touch.
+static bool baba_ready(fopAc_ac_c* a) {
+    const BabaView v = baba_of(a);
+    return *v.action == baba::WAIT && *v.mode == 1;
+}
+
+// Out and in the fight (not hiding, not appearing, not damaged).
+static bool baba_fighting(fopAc_ac_c* a) {
+    const int act = *baba_of(a).action;
+    return act == baba::WAIT || act == baba::ATTACK || act == baba::CHANCE;
+}
+
+static bool baba_dk_caught(daPy_py_c* py) {
+    return py->getDkCaught() || py->getDkCaught2();
 }
 
 // Put an idle enemy into its own chase state.
@@ -439,15 +565,6 @@ static void wake_up(Kind k, fopAc_ac_c* a) {
         auto* e = reinterpret_cast<e_sf_class*>(a);
         e->mAction = sf::FIGHT_RUN;
         e->mActionPhase = 0;
-        break;
-    }
-    case Kind::Bulblin: {
-        // Same values e_rd_normal sets itself when it spots Link with a club.
-        auto* e = reinterpret_cast<e_rd_class*>(a);
-        e->action = rd::FIGHT_RUN;
-        e->mode = -10;
-        e->timer[0] = 60;
-        e->attack_timer = 35;
         break;
     }
     default: break;
@@ -484,12 +601,6 @@ static void start_attack(Kind k, fopAc_ac_c* a, float dist) {
         e->mActionPhase = 0;
         break;
     }
-    case Kind::Bulblin: {
-        auto* e = reinterpret_cast<e_rd_class*>(a);
-        e->action = rd::FIGHT;
-        e->mode = 0;
-        break;
-    }
     default: break;
     }
 }
@@ -513,27 +624,17 @@ static void start_back_off(Kind k, fopAc_ac_c* a) {
         auto* e = reinterpret_cast<e_sf_class*>(a);
         e->mAction = sf::DRAWBACK;
         e->mActionPhase = 0;
-        e->mInvulnerabilityTimer = 6;
-        break;
-    }
-    case Kind::Bulblin: {
-        // The game's own dodge hop (e_rd_avoid), set up exactly like its fight-run code does it.
-        auto* e = reinterpret_cast<e_rd_class*>(a);
-        e->action = rd::AVOID;
-        e->mode = 0;
-        e->damage_timer = 20;
         break;
     }
     default: break;
     }
 }
 
-// Faster attacks, shorter stagger, faster attack decisions, no leash.
+// Faster attacks, shorter stagger, faster attack decisions.
 static void tune_reactions(Kind k, fopAc_ac_c* a) {
     switch (k) {
     case Kind::Bokoblin: {
         auto* e = reinterpret_cast<daE_OC_c*>(a);
-        e->mMoveRange = 0.0f;  // never gives up and walks back to its post
         if (e->mpMorf) {
             if (e->mActionMode == oc::ATTACK) {
                 e->mpMorf->setPlaySpeed(cfg::kAttackAnimSpeed);
@@ -582,29 +683,6 @@ static void tune_reactions(Kind k, fopAc_ac_c* a) {
         }
         break;
     }
-    case Kind::Bulblin: {
-        auto* e = reinterpret_cast<e_rd_class*>(a);
-        if (!bulblin_on_foot_club(e)) {
-            break;
-        }
-        if (e->action == rd::FIGHT_RUN) {
-            e->attack_timer = 35;  // the game's "lost interest" counter never runs out near Link
-            if (e->timer[2] > cfg::kAttackDecisionTimer) {
-                e->timer[2] = cfg::kAttackDecisionTimer;  // vanilla 20-40 ticks between swings
-            }
-        } else if (e->action == rd::FIGHT) {
-            // mode 1 = wind-up, 2 = the swing itself, 3 = recovery (see e_rd_fight).
-            if (e->mode == 1 && e->timer[0] > cfg::kBulblinWindup) {
-                e->timer[0] = cfg::kBulblinWindup;
-            } else if (e->mode == 3 && e->timer[0] > cfg::kBulblinRecover) {
-                e->timer[0] = cfg::kBulblinRecover;
-            } else if (e->mode == 2 && e->anm_p && e->anm_p->getFrame() < cfg::kBulblinSwingFrameLimit) {
-                // Not in wind-up: that mode loops on an exact frame number and speed would skip it.
-                e->anm_p->setPlaySpeed(cfg::kAttackAnimSpeed);
-            }
-        }
-        break;
-    }
     default: break;
     }
 }
@@ -633,6 +711,7 @@ static void tactics_tick() {
     fopAc_ac_c* plr = dComIfGp_getPlayer(0);
     if (plr == nullptr || dComIfGp_event_runCheck()) {
         reset_player_state();
+        g_memory.clear();  // positions change during events; measure fresh afterwards
         return;
     }
 
@@ -686,7 +765,7 @@ static void tactics_tick() {
     // Desperation: Link is low on health, every enemy presses harder.
     const float boost = (dComIfGs_getLife() <= cfg::kDesperationLife) ? cfg::kDesperationBoost : 1.0f;
     const float press = boost * (1.0f + escalation);  // multiplies chances
-    const float power = cfg::kIntensity * press;      // multiplies movement steps
+    const float power = cfg::kIntensity * press;      // multiplies movement rules
 
     // Dodge triggers (rising edges) and counter window (falling edges of swing / roll / guard).
     const bool dodgeTrigger = (swinging && !g_prevSwinging) || (jumpStrike && !g_prevJumpStrike);
@@ -711,142 +790,155 @@ static void tactics_tick() {
     std::vector<fopAc_ac_c*> engaged;
     std::unordered_map<const void*, EnemyMemory> alive;
     for (fopAc_ac_c* a : all) {
-        auto* en = static_cast<fopEn_enemy_c*>(a);
-        if (en->checkDeadFlg() || en->checkDownFlg() || dist_xz(a, plr) > cfg::kEngageRange) {
+        if (dist_xz(a, plr) > cfg::kEngageRange) {
             continue;
+        }
+        // Poison Mites and bees are plain actors, not built on the enemy base class: no dead/down flags.
+        if (a->group == fopAc_ENEMY_e) {
+            auto* en = static_cast<fopEn_enemy_c*>(a);
+            if (en->checkDeadFlg() || en->checkDownFlg()) {
+                continue;
+            }
         }
         auto it = g_memory.find(a);
         alive[a] = (it != g_memory.end()) ? it->second : EnemyMemory{};
         engaged.push_back(a);
+
+        const int prof = fopAcM_GetProfName(a);
+        if (g_seenProcs.insert(prof).second) {
+            mods::log::info("enemy_tactics: new enemy type, proc id {} ({})", prof,
+                            is_adapter(kind_of(a)) ? "full tactics" : "movement only");
+        }
     }
     g_memory.swap(alive);
 
-    // Sense + group alert: idle enemies of the four adapter types wake when Link is close, or when a
-    // neighbour is already fighting.
-    for (fopAc_ac_c* p : engaged) {
-        const Kind pk = kind_of(p);
-        EnemyMemory& pm = g_memory[p];
-        if (pm.wakeCd > 0) {
-            pm.wakeCd--;
-            continue;
-        }
-        if (!is_adapter(pk) || !is_passive(pk, p)) {
-            continue;
-        }
-        bool wake = dist_xz(p, plr) < cfg::kSenseRadius &&
-                    std::fabs(p->current.pos.y - plr->current.pos.y) < cfg::kSenseMaxHeightDiff;
-        if (!wake) {
-            for (fopAc_ac_c* f : engaged) {
-                if (f == p) {
-                    continue;
-                }
-                const Kind fk = kind_of(f);
-                if (is_adapter(fk) && is_fighting(fk, f) && dist_xz(p, f) < cfg::kAlertRadius &&
-                    std::fabs(p->current.pos.y - f->current.pos.y) < cfg::kAlertMaxHeightDiff) {
-                    wake = true;
-                    break;
+    // Optional: wake idle enemies of the four full-tactics types (off by default, see kEnableWake).
+    if (cfg::kEnableWake) {
+        for (fopAc_ac_c* p : engaged) {
+            const Kind pk = kind_of(p);
+            EnemyMemory& pm = g_memory[p];
+            if (pm.wakeCd > 0) {
+                pm.wakeCd--;
+                continue;
+            }
+            if (!is_adapter(pk) || !is_passive(pk, p)) {
+                continue;
+            }
+            bool wake = dist_xz(p, plr) < cfg::kSenseRadius &&
+                        std::fabs(p->current.pos.y - plr->current.pos.y) < cfg::kSenseMaxHeightDiff;
+            if (!wake) {
+                for (fopAc_ac_c* f : engaged) {
+                    if (f == p) {
+                        continue;
+                    }
+                    const Kind fk = kind_of(f);
+                    if (is_adapter(fk) && is_fighting(fk, f) && dist_xz(p, f) < cfg::kAlertRadius &&
+                        std::fabs(p->current.pos.y - f->current.pos.y) < cfg::kAlertMaxHeightDiff) {
+                        wake = true;
+                        break;
+                    }
                 }
             }
-        }
-        if (wake) {
-            wake_up(pk, p);
-            pm.wakeCd = cfg::kWakeCooldown;
+            if (wake) {
+                wake_up(pk, p);
+                pm.wakeCd = cfg::kWakeCooldown;
+            }
         }
     }
 
     std::vector<Chaser> chasers;
-    bool packTrigger = false;  // somebody just began a swing at Link this tick
     for (fopAc_ac_c* a : engaged) {
         const Kind k = kind_of(a);
         EnemyMemory& m = g_memory[a];
-        m.px = 0.0f;
-        m.pz = 0.0f;
+        m.active = false;
+        m.speedK = 0.0f;
+        m.steer = 0.0f;
         if (m.dodgeCd > 0) m.dodgeCd--;
         if (m.chargeCd > 0) m.chargeCd--;
         if (m.counterCd > 0) m.counterCd--;
         if (m.lungeCd > 0) m.lungeCd--;
         if (m.retreatCd > 0) m.retreatCd--;
-        if (m.syncCd > 0) m.syncCd--;
 
-        tune_reactions(k, a);
-
-        const bool attacking = is_adapter(k) && is_attacking(k, a);
-        const bool chasing = is_chasing(k, a);
         const float dist = dist_xz(a, plr);
+        const bool adapter = is_adapter(k);
 
-        // Pack attacks, part 1: note a fresh swing at Link (part 2 queues the followers after this loop).
-        if (attacking && !m.wasAttacking && dist < cfg::kSyncTriggerDist) {
-            packTrigger = true;
-            m.syncDelay = 0;  // the attacker itself is not a follower
-        }
-        // Part 3: a queued follow-up swing comes due. It is dropped if the moment has passed.
-        if (m.syncDelay > 0 && --m.syncDelay == 0) {
-            if (chasing && is_adapter(k) && dist < cfg::kSyncAttackRange) {
-                m.syncCd = cfg::kSyncCooldown;
-                m.wasAttacking = true;  // so this swing does not set off another pack trigger
-                start_attack(k, a, dist);
-                continue;
-            }
-        }
+        // ---- full-tactics enemies: use the enemy's own attack / back-off actions ----
+        if (adapter) {
+            tune_reactions(k, a);
 
-        // Hit and run: their attack just ended and they are back in chase mode, hop out of range.
-        if (m.wasAttacking && !attacking && chasing && can_back_off(k) && m.retreatCd == 0 &&
-            dist < cfg::kRetreatMaxDist && rand01() < std::min(1.0f, cfg::kRetreatChance * press)) {
-            m.wasAttacking = false;
-            m.retreatCd = cfg::kRetreatCooldown;
-            start_back_off(k, a);
-            continue;
-        }
-        m.wasAttacking = attacking;
+            const bool attacking = is_attacking(k, a);
+            const bool chasing = is_chasing(k, a);
 
-        if (!chasing) {
-            m.lungeTicks = 0;
-            continue;
-        }
-        g_anyChaser = true;
-
-        // Adapter rules: use the enemy's own attack / draw-back actions.
-        if (is_adapter(k)) {
-            if (dodgeTrigger && can_back_off(k) && dist < cfg::kDodgeRange && m.dodgeCd == 0 &&
-                rand01() < std::min(1.0f, cfg::kDodgeChance * press)) {
+            // Hit and run: their attack just ended and they are back in chase mode, hop out of range.
+            if (m.wasAttacking && !attacking && chasing && can_back_off(k) && m.retreatCd == 0 &&
+                dist < cfg::kRetreatMaxDist && rand01() < std::min(1.0f, cfg::kRetreatChance * press)) {
+                m.wasAttacking = false;
+                m.retreatCd = cfg::kRetreatCooldown;
                 start_back_off(k, a);
-                m.dodgeCd = cfg::kDodgeCooldown;
                 continue;
             }
-            if (charging && dist < cfg::kChargeReactRange && m.chargeCd == 0) {
-                m.chargeCd = cfg::kChargeCooldown;
-                if (can_back_off(k) && rand01() < 0.5f) {
+            m.wasAttacking = attacking;
+
+            if (chasing) {
+                if (dodgeTrigger && can_back_off(k) && dist < cfg::kDodgeRange && m.dodgeCd == 0 &&
+                    rand01() < std::min(1.0f, cfg::kDodgeChance * press)) {
                     start_back_off(k, a);
-                } else {
-                    start_attack(k, a, dist);
+                    m.dodgeCd = cfg::kDodgeCooldown;
+                    continue;
                 }
-                continue;
+                if (charging && dist < cfg::kChargeReactRange && m.chargeCd == 0) {
+                    m.chargeCd = cfg::kChargeCooldown;
+                    if (can_back_off(k) && rand01() < 0.5f) {
+                        start_back_off(k, a);
+                    } else {
+                        start_attack(k, a, dist);
+                    }
+                    continue;
+                }
+                if (g_openWindow > 0 && dist < cfg::kCounterRange && m.counterCd == 0) {
+                    m.counterCd = cfg::kCounterCooldown;
+                    start_attack(k, a, dist);
+                    continue;
+                }
             }
-            if (g_openWindow > 0 && dist < cfg::kCounterRange && m.counterCd == 0) {
-                m.counterCd = cfg::kCounterCooldown;
-                start_attack(k, a, dist);
-                continue;
+            if (!is_fighting(k, a)) {
+                m.lungeTicks = 0;
+                continue;  // idle: movement rules never touch it
             }
         }
 
-        if (dist < 1.0f) {
+        // ---- movement rules (all enemies): read the enemy's own step since we last looked ----
+        const int prof = fopAcM_GetProfName(a);
+        if (!m.haveLast || dist < 1.0f || !movement_ok(prof, a)) {
+            continue;
+        }
+        m.scale = scale_of(prof);
+        const float sx = a->current.pos.x - m.lastX;
+        const float sz = a->current.pos.z - m.lastZ;
+        const float step = std::sqrt(sx * sx + sz * sz);
+        if (step < cfg::kMinOwnStep || step > cfg::kMaxOwnStep) {
+            m.lungeTicks = 0;
             continue;
         }
         const float ux = (a->current.pos.x - plr->current.pos.x) / dist;  // Link -> enemy
         const float uz = (a->current.pos.z - plr->current.pos.z) / dist;
+        // Only an enemy that is walking/running toward Link is touched (not knockback, not wandering off).
+        if ((sx * -ux + sz * -uz) / step < cfg::kTowardLinkDot) {
+            m.lungeTicks = 0;
+            continue;
+        }
+        m.active = true;
+        m.dx = sx;
+        m.dz = sz;
+        g_anyChaser = true;
         const float side = ((reinterpret_cast<uintptr_t>(a) >> 4) & 1) ? 1.0f : -1.0f;  // fixed per enemy
 
-        // Speed bonus along the enemy's own heading.
-        if (a->speedF > cfg::kMovingSpeed) {
-            const float heading = a->current.angle.y * kAngleToRad;
-            const float extra = a->speedF * cfg::kSpeedBonus * power;
-            add_push(m, std::sin(heading) * extra, std::cos(heading) * extra);
-        }
+        float k_speed = cfg::kSpeedBonus;
 
-        // Lunge: burst toward Link from mid range.
+        // Lunge: a short burst from mid range.
         if (m.lungeTicks > 0) {
             m.lungeTicks--;
-            add_push(m, -ux * cfg::kLungeStep * power, -uz * cfg::kLungeStep * power);
+            k_speed += cfg::kLungeBonus;
         } else if (m.lungeCd == 0 && dist > cfg::kLungeMinDist && dist < cfg::kLungeMaxDist) {
             m.lungeCd = cfg::kLungeCooldown;
             if (rand01() < std::min(1.0f, cfg::kLungeChance * press)) {
@@ -854,66 +946,39 @@ static void tactics_tick() {
             }
         }
 
-        // Lead pursuit: head for where Link is going.
-        if (lspeed >= cfg::kFleeMinSpeed && dist > cfg::kLeadMinDist) {
-            const float tx = plr->current.pos.x + vx * cfg::kLeadTicks - a->current.pos.x;
-            const float tz = plr->current.pos.z + vz * cfg::kLeadTicks - a->current.pos.z;
-            const float td = std::sqrt(tx * tx + tz * tz);
-            if (td > 1.0f) {
-                add_push(m, tx / td * cfg::kLeadStep * power, tz / td * cfg::kLeadStep * power);
-            }
-        }
-
-        // Anti-flee: Link is moving away from this enemy, so it speeds up after him.
+        // Anti-flee: Link is moving away from this enemy.
         if (lspeed >= cfg::kFleeMinSpeed && lspeed <= cfg::kFleeMaxSpeed && dist > cfg::kFleeMinDist &&
-            dist < cfg::kFleeRange) {
-            const float away = -(vx * ux + vz * uz);
-            if (away > 0.5f * lspeed) {
-                add_push(m, -ux * cfg::kFleeStep * power, -uz * cfg::kFleeStep * power);
-            }
+            dist < cfg::kFleeRange && -(vx * ux + vz * uz) > 0.5f * lspeed) {
+            k_speed += cfg::kFleeBonus;
         }
 
-        // You hold your shield up: circle to your side.
+        // Ranged item or camping: close in faster.
+        if (ranged && still) {
+            k_speed += cfg::kRangedBonus;
+        } else if (camping) {
+            k_speed += cfg::kCampBonus;
+        }
+
+        // Steering: shield up -> circle to your side; aiming -> strafe out of the line of fire.
+        float steer = 0.0f;
         if (guard && dist > cfg::kCircleMinDist && dist < cfg::kCircleMaxDist) {
-            add_push(m, -uz * side * cfg::kCircleStep * power, ux * side * cfg::kCircleStep * power);
+            steer = side * cfg::kCircleAngle;
+        }
+        if (ranged && dist < cfg::kAimRange && (ux * fx + uz * fz) > cfg::kAimCosine) {
+            steer = side * cfg::kAimAngle;
         }
 
-        // You aim a ranged item: leave the line of fire sideways while closing in.
-        if (ranged && dist < cfg::kAimRange && (ux * fx + uz * fz) > cfg::kAimCosine) {
-            add_push(m, -uz * side * cfg::kAimDodgeStep * power, ux * side * cfg::kAimDodgeStep * power);
-        }
-        if ((ranged && still) && dist > cfg::kAdvanceMinDist) {
-            add_push(m, -ux * cfg::kAdvanceStep * power, -uz * cfg::kAdvanceStep * power);
-        } else if (camping && dist > cfg::kAdvanceMinDist) {
-            add_push(m, -ux * cfg::kAdvanceStep * 0.5f * power, -uz * cfg::kAdvanceStep * 0.5f * power);
-        }
+        m.speedK = k_speed;
+        m.steer = steer;
 
         if (dist < cfg::kFlankRadius) {
-            const float dx = a->current.pos.x - plr->current.pos.x;
-            const float dz = a->current.pos.z - plr->current.pos.z;
-            chasers.push_back({a, &m, std::atan2(dz, dx)});
+            const float ddx = a->current.pos.x - plr->current.pos.x;
+            const float ddz = a->current.pos.z - plr->current.pos.z;
+            chasers.push_back({a, &m, std::atan2(ddz, ddx)});
         }
     }
 
-    // Pack attacks, part 2: queue a delayed follow-up swing for every other ready chaser near Link.
-    if (packTrigger) {
-        for (fopAc_ac_c* a : engaged) {
-            const Kind k = kind_of(a);
-            EnemyMemory& m = g_memory[a];
-            if (!is_adapter(k) || m.syncDelay > 0 || m.syncCd > 0 || !is_chasing(k, a)) {
-                continue;
-            }
-            const float d = dist_xz(a, plr);
-            if (d >= cfg::kSyncRadius || d <= 1.0f) {
-                continue;
-            }
-            if (rand01() < std::min(1.0f, cfg::kSyncChance * press)) {
-                m.syncDelay = cfg::kSyncMinDelay + int(rand01() * float(cfg::kSyncSpread));
-            }
-        }
-    }
-
-    // Surround: spread chasers evenly around Link, and pull the one nearest his back all the way behind.
+    // Surround: bend the chasers' own headings so they spread around Link, one of them taking his back.
     if (chasers.size() >= 2) {
         std::sort(chasers.begin(), chasers.end(),
                   [](const Chaser& l, const Chaser& r) { return l.angle < r.angle; });
@@ -942,50 +1007,45 @@ static void tactics_tick() {
                 push += clampf(-rearRel, -1.0f, 1.0f) * cfg::kRearPull;
             }
             push = clampf(push, -1.5f, 1.5f);
-            const float dx = cur.actor->current.pos.x - plr->current.pos.x;
-            const float dz = cur.actor->current.pos.z - plr->current.pos.z;
-            const float d = std::sqrt(dx * dx + dz * dz);
-            if (d > cfg::kCircleMinDist) {
-                const float ux = dx / d;
-                const float uz = dz / d;
-                add_push(*cur.mem, -uz * push * cfg::kFlankStep * power, ux * push * cfg::kFlankStep * power);
+            // Rotating a step that points at Link by +theta moves the enemy to a SMALLER angle around
+            // him, so the sign is flipped: positive push = larger angle.
+            if (cur.mem->steer == 0.0f) {
+                cur.mem->steer = -push * cfg::kFlankAngle;
             }
         }
     }
 
-    // Spacing: push crowded pairs apart.
-    for (size_t i = 0; i < chasers.size(); i++) {
-        for (size_t j = i + 1; j < chasers.size(); j++) {
-            fopAc_ac_c* a = chasers[i].actor;
-            fopAc_ac_c* b = chasers[j].actor;
-            const float dx = a->current.pos.x - b->current.pos.x;
-            const float dz = a->current.pos.z - b->current.pos.z;
-            const float d = std::sqrt(dx * dx + dz * dz);
-            if (d > 1.0f && d < cfg::kSpaceRadius) {
-                const float nx = dx / d;
-                const float nz = dz / d;
-                add_push(*chasers[i].mem, nx * cfg::kSpaceStep, nz * cfg::kSpaceStep);
-                add_push(*chasers[j].mem, -nx * cfg::kSpaceStep, -nz * cfg::kSpaceStep);
-            }
-        }
-    }
-
-    // Apply each enemy's combined push once, capped.
+    // Apply: each enemy that moved toward Link on its own gets a bounded extra share of that same step.
     for (fopAc_ac_c* a : engaged) {
         EnemyMemory& m = g_memory[a];
-        const float mag = std::sqrt(m.px * m.px + m.pz * m.pz);
-        if (mag < 0.001f) {
-            continue;
+        if (m.active) {
+            const float theta = clampf(m.steer, -cfg::kMaxSteer, cfg::kMaxSteer);
+            const float c = std::cos(theta);
+            const float s = std::sin(theta);
+            // Own step, rotated by theta.
+            const float rx = m.dx * c - m.dz * s;
+            const float rz = m.dx * s + m.dz * c;
+            const float p = power * m.scale;
+            const float k = clampf(m.speedK * p, 0.0f, 2.0f);
+            float ex = m.dx * k + (rx - m.dx) * cfg::kSteerStrength * p;
+            float ez = m.dz * k + (rz - m.dz) * cfg::kSteerStrength * p;
+            const float mag = std::sqrt(ex * ex + ez * ez);
+            if (mag > cfg::kMaxExtra) {
+                ex *= cfg::kMaxExtra / mag;
+                ez *= cfg::kMaxExtra / mag;
+            }
+            a->current.pos.x += ex;
+            a->current.pos.z += ez;
         }
-        const float scale = mag > cfg::kMaxStep ? cfg::kMaxStep / mag : 1.0f;
-        a->current.pos.x += m.px * scale;
-        a->current.pos.z += m.pz * scale;
+        m.haveLast = true;
+        m.lastX = a->current.pos.x;
+        m.lastZ = a->current.pos.z;
     }
 }
 
 extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError*) {
-    mods::log::info("enemy_tactics v4 initialized");
+    mods::log::info("enemy_tactics v5 initialized");
     return MOD_OK;
 }
 
@@ -996,6 +1056,7 @@ MOD_EXPORT ModResult mod_update(ModError*) {
 
 MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_memory.clear();
+    g_seenProcs.clear();
     reset_player_state();
     g_openWindow = 0;
     g_stillTicks = 0;
@@ -1005,4 +1066,3 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     return MOD_OK;
 }
 }
-// rebuild
