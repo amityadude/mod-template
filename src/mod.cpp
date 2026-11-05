@@ -46,39 +46,41 @@ IMPORT_OPTIONAL_SERVICE(HookService, svc_hook);  // optional: without it the mod
 
 namespace cfg {
 // ---- Reading your moves ----
-constexpr float kReadBase = 0.82f;          // chance to read a move it has no history for
+constexpr float kReadBase = 0.92f;          // chance to read a move it has no history for
 constexpr float kReadHabitBonus = 0.12f;    // extra chance when you keep repeating one move
-constexpr float kReadMax = 0.96f;
+constexpr float kReadMax = 0.99f;
 constexpr float kReadRange = 520.0f;        // it reads swings started within this distance of it
 constexpr float kReadRangeWide = 600.0f;    // spins, jump strikes, down thrust, helm splitter
 constexpr float kReadLinkFacingCos = -0.1f; // narrow moves: you must be swinging roughly toward it
 constexpr int kReadCooldown = 5;
-constexpr float kRecoveryReadMult = 0.75f;  // reading while it is still recovering from its own swing
+constexpr float kRecoveryReadMult = 0.95f;  // reading while it is still recovering from its own swing
 constexpr int kArmTicks = 24;               // how long a read keeps the guard up (0.8 s)
-constexpr int kStreakMax = 4;               // reads in a row before it drops its guard
+constexpr int kStreakMax = 6;               // reads in a row before it drops its guard
+constexpr int kStreakMaxL = 9;            // armor-off Darknut: reads in a row before it drops its guard
+constexpr float kStunCancelFrameL = 12.0f;  // armor-off: it shakes off a hit after this many animation frames
 constexpr int kStreakForget = 150;          // ticks without a read before the streak resets
-constexpr int kExposeTicks = 36;            // your opening after kStreakMax reads (1.2 s)
+constexpr int kExposeTicks = 24;            // your opening after kStreakMax reads (1.2 s)
 // ---- Dodging (armor-off Darknut; needs the dodge-jump hook) ----
-constexpr float kEvadeBackSlash = 0.18f, kEvadeSideSlash = 0.22f;
-constexpr float kEvadeBackJump = 0.55f, kEvadeSideJump = 0.20f;
+constexpr float kEvadeBackSlash = 0.30f, kEvadeSideSlash = 0.40f;
+constexpr float kEvadeBackJump = 0.65f, kEvadeSideJump = 0.25f;
 constexpr float kEvadeBackWide = 0.60f;     // spin / great spin / down thrust
 constexpr float kEvadeSideHead = 0.55f;     // helm splitter
 constexpr float kEvadeBackBash = 0.85f;     // shield bash (it never guards a bash: that would stun it)
 // ---- Offense ----
 constexpr float kRiposteChance = 0.92f;
-constexpr int kRiposteDelay = 4;            // ticks after your swing ends
+constexpr int kRiposteDelay = 2;            // ticks after your swing ends
 constexpr int kRiposteWindow = 26;          // it keeps trying for this long if it is busy
 constexpr float kRiposteRange = 430.0f;
 constexpr float kPressureRange = 380.0f;
-constexpr float kPressureChance = 0.30f;    // per tick while ready and in reach
-constexpr int kAttackGapH = 34;             // minimum ticks between its own attack starts (armored)
-constexpr int kAttackGapL = 28;             // (armor off)
+constexpr float kPressureChance = 0.65f;    // per tick while ready and in reach
+constexpr int kAttackGapH = 14;             // minimum ticks between its own attack starts (armored)
+constexpr int kAttackGapL = 10;             // (armor off)
 constexpr float kLinkReach = 260.0f;        // do not walk into a swing that is already reaching it
-constexpr int kChainMax = 2;                // extra swings without waiting for its recovery
-constexpr float kChainChance = 0.65f;
-constexpr float kChainRange = 330.0f;
-constexpr float kAttackSpeedMult = 1.2f;    // wind-up speed (1.0 = normal)
-constexpr int kMaxGameCooldown = 18;        // clamps the game's own attack timer (normally 75-175 ticks)
+constexpr int kChainMax = 4;                // extra swings without waiting for its recovery
+constexpr float kChainChance = 0.92f;
+constexpr float kChainRange = 380.0f;
+constexpr float kAttackSpeedMult = 1.4f;    // wind-up speed (1.0 = normal)
+constexpr int kMaxGameCooldown = 6;        // clamps the game's own attack timer (normally 75-175 ticks)
 constexpr float kLeapMin = 480.0f;          // armor-off gap closer
 constexpr float kLeapMax = 900.0f;
 constexpr float kLeapChance = 0.5f;
@@ -87,10 +89,12 @@ constexpr int kLeapCooldown = 75;
 constexpr int kTurnStep = 0x1000;           // max turn per tick toward you (the game turns ~0x160-0x800)
 constexpr float kTurnRange = 700.0f;
 constexpr float kEngageRange = 1400.0f;
-constexpr float kWalkSpeedH = 6.5f;         // armored walk (game: 4.3), approach (2.3 -> 4.4)
-constexpr float kApproachSpeedH = 4.4f;
-constexpr float kWalkSpeedL = 7.0f;         // armor-off walk (game: 4.7)
-constexpr float kStrafeSpeedL = 6.6f;       // armor-off circling (game: 4.8)
+constexpr float kWalkSpeedH = 8.5f;         // armored walk (game: 4.3), approach (2.3 -> 4.4)
+constexpr float kApproachSpeedH = 6.0f;
+constexpr float kWalkSpeedL = 9.0f;         // armor-off walk (game: 4.7)
+constexpr float kStrafeSpeedL = 8.0f;       // armor-off circling (game: 4.8)
+constexpr float kDamageMultH = 1.5f;       // its sword damage while armored (game: 4 = one heart)
+constexpr float kDamageMultL = 2.0f;       // armor off (game: 2)
 constexpr int kHistorySize = 12;
 constexpr int kStatusTicks = 150;
 }  // namespace cfg
@@ -135,7 +139,7 @@ std::unordered_map<const void*, Mem> g_mem;
 Stats g_stats;
 int g_statTicks = 0;
 int g_tick = 0;
-int g_logBudget = 16;
+int g_logBudget = 80;
 bool g_hitHook = false;
 bool g_jumpHook = false;
 
@@ -326,7 +330,6 @@ void enter_guard_state(TN* t, const fopAc_ac_c* plr) {
         if (t->mAtInfo.mpCollider == nullptr) {
             t->mAtInfo.mpCollider = &t->mSwordSphs[0];
         }
-        t->mGuardCounterKick = false;
         enter(t, TN::ACT_GUARDL, TN::ACTION2_0_e);
     }
 }
@@ -402,7 +405,7 @@ bool try_read(TN* t, Mem& m, const fopAc_ac_c* plr, AType type, St st, float dis
     g_stats.read++;
     m.streak++;
     m.armed = cfg::kArmTicks;
-    if (m.streak >= cfg::kStreakMax) {
+    if (m.streak >= (h_mode(t) ? cfg::kStreakMax : cfg::kStreakMaxL)) {
         m.streak = 0;
         m.expose = cfg::kExposeTicks;
         g_stats.opening++;
@@ -490,7 +493,7 @@ HookAction on_at_tg_hit(ModContext*, void* args, void*, void*) {
     }
     auto* t = static_cast<TN*>(dst);
     const auto* py = static_cast<daPy_py_c*>(plr);
-    const bool cancel = h_mode(t) ? (t->mNextBreakPart >= 11) : (py->getCutCount() >= 4);
+    const bool cancel = h_mode(t) ? (t->mNextBreakPart >= 11) : (py->getCutCount() >= 3);
     if (cancel) {
         g_stats.negated++;
         return HOOK_SKIP_ORIGINAL;
@@ -577,6 +580,13 @@ void tick() {
         if (m.streak > 0 && ++m.streakAge > cfg::kStreakForget) {
             m.streak = 0;
             m.streakAge = 0;
+        }
+
+        // Armor-off: it shakes off a hit early instead of staying staggered for your combo.
+        if (t->mActionMode1 == TN::ACT_DAMAGEL && t->mActionMode2 >= 2 && t->mpModelMorf2 != nullptr &&
+            t->mpModelMorf2->getFrame() >= cfg::kStunCancelFrameL) {
+            enter(t, TN::ACT_CHASEL, TN::ACTION2_0_e);
+            t->field_0xa91 = true;
         }
 
         const St st = classify(t);
@@ -701,6 +711,15 @@ void tick() {
             }
         }
 
+        // ---- 6b. harder hits (sword damage only; its health is never touched) ----
+        if (st != St::Hurt && st != St::Other) {
+            const int atp = std::max(1, static_cast<int>(std::lround((lmode ? 2.0f * cfg::kDamageMultL : 4.0f * cfg::kDamageMultH))));
+            for (int i = 0; i < 4; i++) {
+                t->mSwordSphs[i].SetAtAtp(atp);
+            }
+            t->mCps.SetAtAtp(atp);
+        }
+
         // ---- 7. faster wind-up, once per swing ----
         if (st == St::Attack && !m.speeded && !changed && t->mpModelMorf2 != nullptr &&
             (t->mActionMode2 == 1 || t->mActionMode2 == 2)) {
@@ -735,7 +754,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
     const ModResult jr = mods::hook::install<TnInitChaseL>();
     g_jumpHook = (jr == MOD_OK) && TnInitChaseL::g_orig != nullptr;
     mods::log::info(
-        "darknut_ruthless v1 initialized | combo-finisher hook {} | dodge-jump hook {} | status line every 5 s "
+        "darknut_ruthless v3 initialized | combo-finisher hook {} | dodge-jump hook {} | status line every 5 s "
         "near a Darknut{}",
         g_hitHook ? "ON" : "UNAVAILABLE", g_jumpHook ? "ON" : "UNAVAILABLE",
         (g_hitHook && g_jumpHook)
