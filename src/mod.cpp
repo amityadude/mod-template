@@ -1,4 +1,15 @@
-// Enemy Tactics v9 ("ruthless, but safe"): smarter and harder enemies, no extra health.
+// Enemy Tactics v10 ("they read your attacks"): smarter and harder enemies, no extra health.
+// v10: v8/v9 never stopped a hit and reacted late (when the blade was already out), so even when their
+//     tactics fired the fight did not feel different. v10 fixes that at the root:
+//   * Attacks are detected the moment you press the button (Link's move id), not when the blade is already
+//     swinging, so enemies react to your wind-up.
+//   * READ: when you start a sword move, each alert enemy in front of you may "read" it: it shields up,
+//     back-hops or side-steps at once, and your hit on it is negated (a hook on the game's hit code).
+//     The more you repeat the same move, the better they read it (they learn your habits); mixing moves
+//     keeps them guessing. After a read they get a short opening, and two reads in a row guarantee that
+//     your next swing connects, so the fight stays beatable.
+//   * Riposte: after a read, the enemy often counter-attacks right away.
+//   * Stronger defaults: faster chase, shorter shield cooldown, more combos, quicker counters.
 // v9: a status line goes to the in-game Logs window every 5 seconds while enemies are near, showing how
 //     many enemies the mod sees and how many times each tactic fired. If a line says "adapters=0", the
 //     mod does not recognise the enemy; if every counter stays 0 while you fight, tell me the line.
@@ -32,11 +43,13 @@
 // 30 ticks = 1 second. All tunables are in namespace cfg.
 
 #include "mods/service.hpp"
+#include "mods/svc/hook.hpp"
 #include "mods/svc/log.hpp"
 
 // Game includes
 #include "SSystem/SComponent/c_cc_d.h"
 #include "SSystem/SComponent/c_cc_s.h"
+#include "d/d_cc_d.h"
 #include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_b_tn.h"
 #include "d/actor/d_a_e_db.h"
@@ -61,6 +74,7 @@
 DEFINE_MOD();
 
 IMPORT_SERVICE(LogService, svc_log);
+IMPORT_OPTIONAL_SERVICE(HookService, svc_hook);  // optional: without it the mod still runs, just without READ
 
 namespace cfg {
 // --- global
@@ -74,7 +88,7 @@ constexpr float kDesperationBoost = 1.5f;  // ...makes every rule this much stro
 constexpr float kMinOwnStep = 0.8f;        // slower than this = standing still, never touched
 constexpr float kMaxOwnStep = 40.0f;       // faster than this = teleport / projectile, never touched
 constexpr float kTowardLinkDot = 0.4f;     // only enemies heading toward Link (within ~66 degrees) are touched
-constexpr float kMaxExtra = 8.0f;          // the most any rule set adds to one enemy in one tick
+constexpr float kMaxExtra = 10.0f;         // the most any rule set adds to one enemy in one tick
 
 // --- escalation: the longer a fight lasts, the harder they press
 constexpr int kEscalationStartTicks = 300; // starts after 10 s of fighting
@@ -83,7 +97,7 @@ constexpr float kEscalationMax = 0.5f;     // +50%
 constexpr int kCalmResetTicks = 150;       // 5 s with nobody chasing resets it
 
 // --- speed: chasing enemies move this much faster (0.25 = +25%)
-constexpr float kSpeedBonus = 0.25f;
+constexpr float kSpeedBonus = 0.35f;
 
 // --- lunge: short burst at mid range (their own movement doubled for a moment)
 constexpr float kLungeMinDist = 350.0f;
@@ -126,15 +140,15 @@ constexpr int kChargeCooldown = 150;
 // --- opening: your swing, roll or shield drop just ended -> they counter at once
 constexpr int kOpenWindow = 20;
 constexpr float kCounterRange = 330.0f;
-constexpr int kCounterCooldown = 120;
+constexpr int kCounterCooldown = 60;
 
 // --- you start a sword swing or jump strike -> they dodge (back-hop)
 constexpr float kDodgeRange = 280.0f;
-constexpr float kDodgeChance = 0.5f;
+constexpr float kDodgeChance = 0.7f;
 constexpr int kDodgeCooldown = 120;
 
 // --- hit and run: after their own attack ends they hop out of your counter range
-constexpr float kRetreatChance = 0.3f;
+constexpr float kRetreatChance = 0.4f;
 constexpr float kRetreatMaxDist = 300.0f;
 constexpr int kRetreatCooldown = 90;
 
@@ -168,13 +182,13 @@ constexpr float kGuardChance = 0.8f;         // x pressure, for swings and jump 
 constexpr float kGuardBashChance = 1.0f;     // shield bashes are always answered
 constexpr float kGuardRange = 350.0f;
 constexpr float kGuardFacingCos = 0.3f;      // you must be facing them (1 = dead ahead)
-constexpr int kGuardCooldown = 60;           // per enemy; lower = harder to hit, 0 = always shielded
+constexpr int kGuardCooldown = 30;           // per enemy; lower = harder to hit, 0 = always shielded
 constexpr int kGuardHoldMax = 75;            // keeps it up while you keep attacking, at most this long
 constexpr short kStaggerTicks = 8;           // Lizalfos/Dynalfos stagger is capped to this (vanilla 20)
 
 // --- combos: right after one of its own swings ends, an enemy may swing again if you are still in reach
 constexpr bool kEnableCombo = true;
-constexpr float kComboChance = 0.35f;        // x pressure
+constexpr float kComboChance = 0.5f;         // x pressure
 constexpr float kComboRange = 260.0f;
 constexpr int kComboCooldown = 75;           // per enemy, so it is at most one extra swing per ~2.5 s
 
@@ -216,6 +230,33 @@ constexpr float kBulblinSwingFrameLimit = 50.0f;  // swing speed-up applies befo
 constexpr float kAttackAnimSpeed = 1.5f;   // 1.0 = vanilla speed
 constexpr float kStaggerAnimSpeed = 2.0f;
 constexpr short kAttackDecisionTimer = 6;  // Lizalfos/Stalfos/Bulblin attack timer is capped to this (vanilla 10-40)
+
+// --- v10 READ: you start a sword move and an alert enemy in front of you reads it (shield, back-hop or side-step) and
+// your hit on it is negated. Needs the hook service; without it the rest of the mod still works.
+constexpr bool kEnableRead = true;
+constexpr float kReadBase = 0.50f;           // chance that a ready enemy reads one of your moves
+constexpr float kReadHabit = 0.40f;          // extra when most of your recent moves are the same one (they learn you)
+constexpr float kReadMax = 0.88f;            // never above this
+constexpr float kReadLateMult = 0.6f;        // enemies that were not armed at wind-up may still read the hit itself
+constexpr int kReadCooldown = 30;            // after a read this enemy cannot read again for 1 s: your opening
+constexpr int kReadMaxStreak = 2;            // two reads in a row without a hit landing: the next swing connects
+constexpr int kReadStreakDecay = 120;        // 4 s without a read forgets the streak
+constexpr float kReadStartRange = 380.0f;    // for a forward swing the enemy must be this close
+constexpr float kReadWideRange = 320.0f;     // spin / down thrust / large jump: any direction, this close
+constexpr float kReadLinkFacingCos = 0.15f;  // forward swing: you must be facing it (1 = dead ahead)
+constexpr float kReadFacingCos = -0.2f;      // the enemy must not have its back to you (backstabs always land)
+constexpr float kReadMaxDist = 420.0f;       // late read: farther than this, the hit lands
+constexpr int kArmTicks = 22;                // a read at wind-up negates hits for this long (about one swing)
+constexpr int kDecisionHold = 10;            // late read: one roll per swing, reused for this many ticks
+constexpr float kReadBokoblinMult = 0.85f;   // Bokoblins read a little worse than the lizard/skeleton fighters
+constexpr float kReadGenericMult = 0.5f;     // all other enemies (x their own gentleness scale)
+constexpr float kRiposteChance = 0.6f;       // x pressure: after a read, strike back
+constexpr int kRiposteDelay = 10;            // ticks after the read
+constexpr float kRiposteRange = 380.0f;
+constexpr bool kEnableHop = true;            // enemies without a shield back-hop / side-step out of the blade
+constexpr float kHopSpeed = 12.0f;           // units per tick, tapering off
+constexpr int kHopTicks = 6;
+constexpr int kHistorySize = 12;             // how many of your last moves they remember
 }  // namespace cfg
 
 // Plant = Deku Baba / Hebi Baba (timer only, they never move). Darknut = its own cooldown plus chase rules.
@@ -431,6 +472,21 @@ struct EnemyMemory {
     float boost = 1.0f;        // wounded boost, 1.0 when healthy
     float lead = 0.0f;         // radians to bend its step toward where Link is going
 
+    // v10 READ
+    int armed = 0;             // > 0: it read your last move at wind-up, hits on it are negated
+    int readCd = 0;            // after a read it cannot read again for a while (your opening)
+    int readStreak = 0;        // reads in a row without one of your hits landing
+    int readStreakAge = 0;
+    int decisionTick = -1000;  // late read: tick of the last roll
+    bool decisionBlock = false;
+    bool pending = false;      // a late read happened in the hit code, react at the next tick
+    int pendingType = 1;       // AType of that late read
+    int riposteIn = 0;         // > 0: counts down to a counter-attack
+    int riposteTry = 0;        // > 0: the counter-attack is due, waiting for the enemy to be ready for it
+    int hopTicks = 0;          // > 0: back-hop / side-step in progress
+    float hopX = 0.0f;
+    float hopZ = 0.0f;
+
     bool haveLast = false;  // position after our last edit, to measure the enemy's own step
     float lastX = 0.0f;
     float lastZ = 0.0f;
@@ -451,6 +507,7 @@ static bool g_prevJumpStrike = false;
 static bool g_prevBash = false;
 struct Stats {
     int guard = 0, dodge = 0, charge = 0, counter = 0, combo = 0, pack = 0, retreat = 0, lunge = 0, moved = 0;
+    int read = 0, negated = 0, landed = 0, riposte = 0, hop = 0;
 };
 static Stats g_stats;  // counts since the last status line
 static int g_statTicks = 0;
@@ -467,6 +524,24 @@ static bool g_havePrevPos = false;
 static float g_prevX = 0.0f;
 static float g_prevZ = 0.0f;
 static uint32_t g_rng = 0x2545F491u;
+
+// v10 state
+enum class AType { None, Slash, Jump, Spin, Down, Head, Large, Bash };
+static int g_tick = 0;                 // game ticks since the mod started
+static float g_press = 1.0f;           // this tick's pressure (1.0 = calm)
+static u16 g_prevProc = 0;
+static int g_sinceAttackStart = 1000;
+static AType g_hist[cfg::kHistorySize];
+static int g_histCount = 0;
+static int g_histHead = 0;
+static bool g_hookOk = false;
+static int g_logBudget = 14;           // read events printed to the log (then only the status line)
+static int g_layoutGood = 0;           // run-time check that the mod's struct layout matches the game
+static int g_layoutBad = 0;
+static int g_moveSamples = 0;
+static int g_fightSamples = 0;
+static bool g_layoutMismatch = false;
+static bool g_layoutReported = false;
 
 constexpr float kPi = 3.14159265f;
 constexpr float kTwoPi = 6.28318531f;
@@ -955,6 +1030,303 @@ struct Chaser {
     float angle;  // angle around Link
 };
 
+// ===================================== v10: reading your attacks =====================================
+
+// What kind of sword move is Link doing? None = not an attack (walking, charging, recoil, landing...).
+static AType attack_type_of(u16 proc) {
+    switch (proc) {
+    case daAlink_c::PROC_CUT_NORMAL:
+    case daAlink_c::PROC_CUT_FINISH:
+    case daAlink_c::PROC_CUT_FINISH_JUMP_UP: return AType::Slash;
+    case daAlink_c::PROC_CUT_JUMP: return AType::Jump;
+    case daAlink_c::PROC_CUT_TURN: return AType::Spin;
+    case daAlink_c::PROC_CUT_DOWN: return AType::Down;
+    case daAlink_c::PROC_CUT_HEAD: return AType::Head;
+    case daAlink_c::PROC_CUT_LARGE_JUMP: return AType::Large;
+    case daAlink_c::PROC_GUARD_ATTACK: return AType::Bash;
+    default: return AType::None;
+    }
+}
+
+static const char* atype_name(AType t) {
+    switch (t) {
+    case AType::Slash: return "slash";
+    case AType::Jump: return "jump strike";
+    case AType::Spin: return "spin attack";
+    case AType::Down: return "down thrust";
+    case AType::Head: return "helm splitter";
+    case AType::Large: return "great spin";
+    case AType::Bash: return "shield bash";
+    default: return "attack";
+    }
+}
+
+// Moves that are hard to see coming read less often.
+static float type_mult(AType t) {
+    switch (t) {
+    case AType::Slash: return 1.0f;
+    case AType::Jump: return 0.85f;
+    case AType::Spin: return 0.7f;
+    case AType::Down: return 0.6f;
+    case AType::Head: return 0.8f;
+    case AType::Large: return 0.6f;
+    case AType::Bash: return 0.9f;
+    default: return 0.8f;
+    }
+}
+
+static void remember_attack(AType t) {
+    g_hist[g_histHead] = t;
+    g_histHead = (g_histHead + 1) % cfg::kHistorySize;
+    if (g_histCount < cfg::kHistorySize) {
+        g_histCount++;
+    }
+}
+
+// Share of your recent moves that were this one (0.25 until they have seen a few).
+static float habit_share(AType t) {
+    if (g_histCount < 4) {
+        return 0.25f;
+    }
+    int n = 0;
+    for (int i = 0; i < g_histCount; i++) {
+        if (g_hist[i] == t) {
+            n++;
+        }
+    }
+    return float(n) / float(g_histCount);
+}
+
+// Run-time check that the struct layout this mod was compiled with is the one the game uses.
+static bool layout_plausible(Kind k, fopAc_ac_c* a) {
+    switch (k) {
+    case Kind::Bokoblin: {
+        const int m = reinterpret_cast<daE_OC_c*>(a)->mActionMode;
+        return m >= 0 && m < 100;
+    }
+    case Kind::Lizalfos: {
+        auto* e = reinterpret_cast<e_dn_class*>(a);
+        return e->action >= 0 && e->action < 100 && e->mode >= -100 && e->mode < 200;
+    }
+    case Kind::Dynalfos: {
+        auto* e = reinterpret_cast<e_mf_class*>(a);
+        return e->mAction >= 0 && e->mAction < 100 && e->field_0x5b4 >= -100 && e->field_0x5b4 < 200;
+    }
+    case Kind::Stalfos: {
+        auto* e = reinterpret_cast<e_sf_class*>(a);
+        return e->mAction >= 0 && e->mAction < 100 && e->mActionPhase >= -100 && e->mActionPhase < 200;
+    }
+    default: return true;
+    }
+}
+
+// Alert, standing, and not facing away from Link: able to see a swing coming.
+static bool read_ready(Kind k, fopAc_ac_c* a, const EnemyMemory& m, fopAc_ac_c* plr, float dist) {
+    if (dist < 1.0f) {
+        return false;
+    }
+    if (a->group == fopAc_ENEMY_e) {
+        auto* en = static_cast<fopEn_enemy_c*>(a);
+        if (en->checkDeadFlg() || en->checkDownFlg()) {
+            return false;
+        }
+    }
+    const float ang = a->shape_angle.y * kAngleToRad;
+    const float ex = (plr->current.pos.x - a->current.pos.x) / dist;  // enemy -> Link
+    const float ez = (plr->current.pos.z - a->current.pos.z) / dist;
+    if (std::sin(ang) * ex + std::cos(ang) * ez < cfg::kReadFacingCos) {
+        return false;
+    }
+    if (is_adapter(k)) {
+        return is_chasing(k, a);  // not mid-swing, not staggered, not already guarding: those states keep their own rules
+    }
+    return m.active;  // everyone else: it must be moving toward Link on its own
+}
+
+static float read_chance(Kind k, AType t, const EnemyMemory& m) {
+    const float habit = clampf((habit_share(t) - 0.25f) / 0.5f, 0.0f, 1.0f);
+    float p = cfg::kReadBase + cfg::kReadHabit * habit;
+    p *= type_mult(t);
+    if (k == Kind::Bokoblin) {
+        p *= cfg::kReadBokoblinMult;
+    } else if (!can_guard(k)) {
+        p *= cfg::kReadGenericMult * m.scale;
+    }
+    p *= m.boost * (0.85f + 0.15f * g_press);
+    return clampf(p, 0.0f, cfg::kReadMax);
+}
+
+// Back-hop / side-step: a short, tapering slide away from Link, about 50 degrees off straight back.
+static void start_hop(EnemyMemory& m, fopAc_ac_c* a, fopAc_ac_c* plr) {
+    const float dx = a->current.pos.x - plr->current.pos.x;
+    const float dz = a->current.pos.z - plr->current.pos.z;
+    const float d = std::sqrt(dx * dx + dz * dz);
+    if (d < 1.0f) {
+        return;
+    }
+    const float ux = dx / d;
+    const float uz = dz / d;
+    const float ang = (rand01() < 0.5f ? 1.0f : -1.0f) * 0.9f;
+    const float c = std::cos(ang);
+    const float s = std::sin(ang);
+    m.hopX = (ux * c - uz * s) * cfg::kHopSpeed;
+    m.hopZ = (ux * s + uz * c) * cfg::kHopSpeed;
+    m.hopTicks = cfg::kHopTicks;
+    g_stats.hop++;
+}
+
+// The visible part of a read. Shield fighters raise the shield or use their own back-hop; others side-step.
+static void do_react(Kind k, fopAc_ac_c* a, EnemyMemory& m, fopAc_ac_c* plr, AType t) {
+    if (can_guard(k)) {
+        if (!is_chasing(k, a)) {
+            return;  // only from the run-at-Link state, where injecting an action is safe
+        }
+        if (rand01() < 0.55f) {
+            start_guard(k, a, t == AType::Jump);
+            g_stats.guard++;
+            m.guardCd = cfg::kGuardCooldown;
+            m.guardHold = 0;
+        } else {
+            start_back_off(k, a);
+            g_stats.dodge++;
+            m.dodgeCd = cfg::kDodgeCooldown;
+        }
+    } else if (cfg::kEnableHop) {
+        start_hop(m, a, plr);
+    }
+}
+
+static void arm_read(EnemyMemory& m, float press) {
+    m.armed = cfg::kArmTicks;
+    m.readCd = cfg::kReadCooldown;
+    m.readStreak++;
+    m.readStreakAge = 0;
+    m.riposteIn = (rand01() < std::min(1.0f, cfg::kRiposteChance * press)) ? cfg::kRiposteDelay : 0;
+    m.riposteTry = 0;
+    g_stats.read++;
+}
+
+static void log_read(const char* how, fopAc_ac_c* a, AType t, float chance) {
+    if (g_logBudget <= 0) {
+        return;
+    }
+    g_logBudget--;
+    mods::log::info("enemy_tactics: READ ({}) enemy proc {} saw your {} (chance {:.0f}%)", how,
+                    fopAcM_GetProfName(a), atype_name(t), chance * 100.0f);
+}
+
+// You just started a sword move: every ready enemy in front of you rolls to read it, right now.
+static void try_read(Kind k, fopAc_ac_c* a, EnemyMemory& m, fopAc_ac_c* plr, AType t, float press,
+                     float fx, float fz) {
+    m.armed = 0;  // a new move clears the last one
+    if (k == Kind::None || k == Kind::Plant || k == Kind::Darknut) {
+        return;
+    }
+    if (m.readCd > 0 || m.readStreak >= cfg::kReadMaxStreak) {
+        return;
+    }
+    const float dist = dist_xz(a, plr);
+    if (dist < 1.0f) {
+        return;
+    }
+    const bool wide = (t == AType::Spin || t == AType::Down || t == AType::Large);
+    if (dist > (wide ? cfg::kReadWideRange : cfg::kReadStartRange)) {
+        return;
+    }
+    if (!wide) {
+        const float ex = (a->current.pos.x - plr->current.pos.x) / dist;  // Link -> enemy
+        const float ez = (a->current.pos.z - plr->current.pos.z) / dist;
+        if (ex * fx + ez * fz < cfg::kReadLinkFacingCos) {
+            return;  // you are not swinging toward it
+        }
+    }
+    if (!read_ready(k, a, m, plr, dist)) {
+        return;
+    }
+    const float chance = read_chance(k, t, m);
+    if (rand01() >= chance) {
+        return;
+    }
+    arm_read(m, press);
+    log_read("wind-up", a, t, chance);
+    do_react(k, a, m, plr, t);
+}
+
+// The game's own hit code, hooked by name. A sword hit from Link on an enemy that read the move is cancelled
+// before anything is applied: no damage, no flinch, no hit effect (the blade simply misses).
+DEFINE_HOOK_SYMBOL("cCcS::SetAtTgCommonHitInf", void(cCcS*, cCcD_Obj*, cCcD_Obj*, cXyz*), AtTgHit);
+
+static constexpr u32 kReadAtMask = u32(AT_TYPE_NORMAL_SWORD) | u32(AT_TYPE_MASTER_SWORD) |
+                                   u32(AT_TYPE_SHIELD_ATTACK) | u32(AT_TYPE_WOLF_CUT_TURN) |
+                                   u32(AT_TYPE_WOLF_ATTACK);
+
+static HookAction on_at_tg_hit(ModContext*, void* args, void*, void*) {
+    if (!cfg::kEnableRead || g_layoutMismatch) {
+        return HOOK_CONTINUE;
+    }
+    cCcD_Obj* at = mods::arg<cCcD_Obj*>(args, 1);
+    cCcD_Obj* tg = mods::arg<cCcD_Obj*>(args, 2);
+    if (at == nullptr || tg == nullptr || (u32(at->GetAtType()) & kReadAtMask) == 0) {
+        return HOOK_CONTINUE;
+    }
+    cCcD_Stts* as = at->GetStts();
+    cCcD_Stts* ts = tg->GetStts();
+    fopAc_ac_c* plr = dComIfGp_getPlayer(0);
+    if (as == nullptr || ts == nullptr || plr == nullptr) {
+        return HOOK_CONTINUE;
+    }
+    fopAc_ac_c* dst = ts->GetAc();
+    if (as->GetAc() != plr || dst == nullptr || dst == plr) {
+        return HOOK_CONTINUE;
+    }
+    auto it = g_memory.find(dst);
+    if (it == g_memory.end()) {
+        return HOOK_CONTINUE;  // not an enemy this mod handles
+    }
+    EnemyMemory& m = it->second;
+    const Kind k = kind_of(dst);
+    if (k == Kind::None || k == Kind::Plant || k == Kind::Darknut) {
+        return HOOK_CONTINUE;
+    }
+
+    // Read at wind-up: the blow misses (for as long as this move lasts).
+    if (m.armed > 0) {
+        g_stats.negated++;
+        return HOOK_SKIP_ORIGINAL;
+    }
+    // Late read: one roll per move, reused while the blade keeps overlapping it.
+    if (g_tick - m.decisionTick <= cfg::kDecisionHold) {
+        if (m.decisionBlock) {
+            g_stats.negated++;
+            return HOOK_SKIP_ORIGINAL;
+        }
+        return HOOK_CONTINUE;
+    }
+    m.decisionTick = g_tick;
+    m.decisionBlock = false;
+    const float dist = dist_xz(dst, plr);
+    if (m.readCd == 0 && m.readStreak < cfg::kReadMaxStreak && dist <= cfg::kReadMaxDist &&
+        read_ready(k, dst, m, plr, dist)) {
+        AType t = attack_type_of(static_cast<daAlink_c*>(plr)->mProcID);
+        if (t == AType::None) {
+            t = AType::Slash;
+        }
+        const float chance = read_chance(k, t, m) * cfg::kReadLateMult;
+        if (rand01() < chance) {
+            arm_read(m, g_press);
+            m.decisionBlock = true;
+            m.pending = true;
+            m.pendingType = static_cast<int>(t);
+            g_stats.negated++;
+            log_read("late", dst, t, chance);
+            return HOOK_SKIP_ORIGINAL;
+        }
+    }
+    m.readStreak = 0;  // this one connects: they have to start over
+    g_stats.landed++;
+    return HOOK_CONTINUE;
+}
+
 static void reset_player_state() {
     g_prevSwinging = g_prevRolling = g_prevJumpStrike = g_prevGuard = g_prevBash = false;
     g_havePrevPos = false;
@@ -976,7 +1348,11 @@ static void tactics_tick() {
     const bool swinging = py->getCutAtFlg();
     const bool rolling = py->checkFrontRoll();
     const bool jumpStrike = py->checkCutJumpMode();
-    const u16 proc = link->mProcID;
+    const u16 procRaw = link->mProcID;
+    if (procRaw >= 0x200) {
+        g_layoutBad += 4;  // no such move id exists: the Link struct is laid out differently than this mod assumes
+    }
+    const u16 proc = g_layoutMismatch ? u16(0) : procRaw;
     const bool bashing = proc == daAlink_c::PROC_GUARD_ATTACK;  // Link's shield bash
     const bool ranged = proc == daAlink_c::PROC_BOW_SUBJECT || proc == daAlink_c::PROC_BOW_MOVE ||
                         proc == daAlink_c::PROC_BOOMERANG_SUBJECT ||
@@ -1034,13 +1410,28 @@ static void tactics_tick() {
             : 0.0f;
     const float press = boost * (1.0f + escalation + adaptive);  // multiplies chances
     const float power = cfg::kIntensity * press;      // multiplies movement rules
+    g_tick++;
+    g_press = press;
 
     // Dodge triggers (rising edges) and counter window (falling edges of swing / roll / guard).
-    const bool jumpStart = jumpStrike && !g_prevJumpStrike;
-    const bool dodgeTrigger = (swinging && !g_prevSwinging) || jumpStart;
-    const bool bashStart = bashing && !g_prevBash;
-    const bool guardTrigger = dodgeTrigger || bashStart;
-    const bool linkAttacking = swinging || jumpStrike || bashing;
+    // v10: a move is detected when Link's move id changes to it (the moment you press the button, before the
+    // blade is out); the sword-active flag rising catches repeated swings that keep the same move id.
+    const AType atype = attack_type_of(proc);
+    g_sinceAttackStart++;
+    const bool procStart = atype != AType::None && proc != g_prevProc;
+    const bool flagStart = swinging && !g_prevSwinging && g_sinceAttackStart > 8;
+    const bool attackStart = procStart || flagStart;
+    const AType startType = (atype != AType::None) ? atype : AType::Slash;
+    if (attackStart) {
+        g_sinceAttackStart = 0;
+        remember_attack(startType);
+    }
+    g_prevProc = proc;
+    const bool jumpStart = procStart && atype == AType::Jump;
+    const bool dodgeTrigger = attackStart;
+    const bool bashStart = procStart && atype == AType::Bash;
+    const bool guardTrigger = attackStart;
+    const bool linkAttacking = swinging || jumpStrike || bashing || (atype != AType::None);
     if ((!swinging && g_prevSwinging) || (!rolling && g_prevRolling) || (!guard && g_prevGuard) ||
         (!jumpStrike && g_prevJumpStrike)) {
         g_openWindow = cfg::kOpenWindow;
@@ -1124,6 +1515,13 @@ static void tactics_tick() {
         }
     }
 
+    // v10: you just began a sword move, so every ready enemy in front of you rolls to read it right now.
+    if (attackStart && cfg::kEnableRead && !g_layoutMismatch) {
+        for (fopAc_ac_c* a : engaged) {
+            try_read(kind_of(a), a, g_memory[a], plr, startType, press, fx, fz);
+        }
+    }
+
     std::vector<Chaser> chasers;
     bool packTrigger = false;  // somebody just began a swing at Link this tick
     for (fopAc_ac_c* a : engaged) {
@@ -1140,10 +1538,39 @@ static void tactics_tick() {
         if (m.syncCd > 0) m.syncCd--;
         if (m.comboCd > 0) m.comboCd--;
         if (m.guardCd > 0) m.guardCd--;
+        if (m.armed > 0) m.armed--;
+        if (m.readCd > 0) m.readCd--;
+        if (m.readStreak > 0 && ++m.readStreakAge > cfg::kReadStreakDecay) {
+            m.readStreak = 0;
+            m.readStreakAge = 0;
+        }
 
         const float dist = dist_xz(a, plr);
-        const bool adapter = is_adapter(k);
+        const bool adapter = is_adapter(k) && !g_layoutMismatch;
         const int profId = fopAcM_GetProfName(a);
+
+        // v10 self-check: do the enemy's state fields hold sane values, and are enemies that run at Link in
+        // a fighting state? If not, this mod was built for a different game version (see layout_plausible).
+        if (!g_layoutMismatch && is_adapter(k)) {
+            if (layout_plausible(k, a)) {
+                g_layoutGood++;
+            } else {
+                g_layoutBad++;
+            }
+            if (m.haveLast && dist > 1.0f && dist < 700.0f) {
+                const float qx = a->current.pos.x - m.lastX;
+                const float qz = a->current.pos.z - m.lastZ;
+                const float qs = std::sqrt(qx * qx + qz * qz);
+                if (qs > 3.0f && qs < cfg::kMaxOwnStep &&
+                    (qx * (plr->current.pos.x - a->current.pos.x) + qz * (plr->current.pos.z - a->current.pos.z)) /
+                            (qs * dist) > 0.6f) {
+                    g_moveSamples++;
+                    if (is_fighting(k, a)) {
+                        g_fightSamples++;
+                    }
+                }
+            }
+        }
 
         // Plants never move: timer only. Darknut and Bulblin: their own timers, then the movement rules.
         if (k == Kind::Plant) {
@@ -1169,10 +1596,33 @@ static void tactics_tick() {
         }
         const float myPress = press * m.boost;
 
+        // v10: a late read made inside the hit code gets its visible reaction now.
+        if (m.pending) {
+            m.pending = false;
+            if (!g_layoutMismatch) {
+                do_react(k, a, m, plr, static_cast<AType>(m.pendingType));
+            }
+        }
+
         // ---- full-tactics enemies: use the enemy's own attack / back-off actions ----
         if (adapter) {
             tune_reactions(k, a);
             tune_awareness(k, a);
+
+            // v10 riposte: it read your move, now it hits back while you are still recovering.
+            if (m.riposteIn > 0 && --m.riposteIn == 0) {
+                m.riposteTry = 24;  // due now; fire as soon as it is back in a state that can swing
+            }
+            if (m.riposteTry > 0) {
+                m.riposteTry--;
+                if (dist > 1.0f && dist < cfg::kRiposteRange && (is_chasing(k, a) || in_guard(k, a))) {
+                    m.riposteTry = 0;
+                    m.wasAttacking = true;
+                    start_attack(k, a, dist);
+                    g_stats.riposte++;
+                    continue;
+                }
+            }
 
             // Defense: while the shield is up and you keep attacking, keep it up (it drops soon after you stop).
             if (cfg::kEnableDefense && can_guard(k)) {
@@ -1438,13 +1888,33 @@ static void tactics_tick() {
             a->current.pos.z += ez;
             g_stats.moved++;
         }
+        if (m.hopTicks > 0) {  // v10 back-hop / side-step after a read, tapering off
+            const float f = 1.5f * float(m.hopTicks) / float(cfg::kHopTicks);
+            a->current.pos.x += m.hopX * f;
+            a->current.pos.z += m.hopZ * f;
+            m.hopTicks--;
+        }
         m.haveLast = true;
         m.lastX = a->current.pos.x;
         m.lastZ = a->current.pos.z;
     }
 
+    // v10 self-check verdict. Only the strong test (state fields holding impossible values) switches the mod
+    // off; the moving-vs-fighting ratio is just printed in the status line as a diagnostic.
+    if (!g_layoutMismatch && g_layoutBad >= 12 && g_layoutBad * 2 > g_layoutGood) {
+        g_layoutMismatch = true;
+    }
+    if (g_layoutMismatch && !engaged.empty() && ++g_statTicks >= 150) {
+        g_statTicks = 0;
+        mods::log::error(
+            "enemy_tactics: LAYOUT MISMATCH (bad={} good={} moving={} fighting={}). The enemy/Link fields hold "
+            "impossible values, so this mod was compiled against a different game version than the one "
+            "running and the tactics are switched off. Rebuild it against your game's source.",
+            g_layoutBad, g_layoutGood, g_moveSamples, g_fightSamples);
+    }
+
     // Status line (see the v9 note at the top). One line per 5 seconds while enemies are near.
-    if (!engaged.empty()) {
+    if (!engaged.empty() && !g_layoutMismatch) {
         int nAdapters = 0;
         int nChasing = 0;
         for (fopAc_ac_c* a : engaged) {
@@ -1463,11 +1933,13 @@ static void tactics_tick() {
         if (++g_statTicks >= 150) {
             g_statTicks = 0;
             mods::log::info(
-                "enemy_tactics: engaged={} adapters={} chasing={} | guard={} dodge={} counter={} combo={} "
-                "pack={} retreat={} charge={} lunge={} moved={} | pressure={:.2f}",
-                engaged.size(), nAdapters, nChasing, g_stats.guard, g_stats.dodge, g_stats.counter,
-                g_stats.combo, g_stats.pack, g_stats.retreat, g_stats.charge, g_stats.lunge, g_stats.moved,
-                press);
+                "enemy_tactics: engaged={} adapters={} chasing={} | READ={} negated={} landed={} riposte={} "
+                "hop={} | guard={} dodge={} counter={} combo={} pack={} retreat={} charge={} lunge={} moved={} "
+                "| pressure={:.2f} | hook={} layout good={} bad={} | chasing-samples moving={} fighting={}",
+                engaged.size(), nAdapters, nChasing, g_stats.read, g_stats.negated, g_stats.landed,
+                g_stats.riposte, g_stats.hop, g_stats.guard, g_stats.dodge, g_stats.counter, g_stats.combo,
+                g_stats.pack, g_stats.retreat, g_stats.charge, g_stats.lunge, g_stats.moved, press,
+                g_hookOk ? "ON" : "OFF", g_layoutGood, g_layoutBad, g_moveSamples, g_fightSamples);
             g_stats = Stats{};
         }
     }
@@ -1475,7 +1947,16 @@ static void tactics_tick() {
 
 extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError*) {
-    mods::log::info("enemy_tactics v9 initialized (status lines every 5 s while enemies are near)");
+    const ModResult hr = mods::hook::add_pre<AtTgHit>(on_at_tg_hit);
+    g_hookOk = (hr == MOD_OK);
+    if (g_hookOk) {
+        mods::log::info("enemy_tactics v10 initialized | hit-read hook ON | status lines every 5 s near enemies");
+    } else {
+        mods::log::warn(
+            "enemy_tactics v10 initialized | hit-read hook UNAVAILABLE (code {}): your game build has no symbol "
+            "manifest or no such symbol. Everything except READ still runs.",
+            static_cast<int>(hr));
+    }
     return MOD_OK;
 }
 
@@ -1498,6 +1979,13 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_stats = Stats{};
     g_statTicks = 0;
     g_loggedFirstFight = false;
+    g_tick = 0;
+    g_prevProc = 0;
+    g_sinceAttackStart = 1000;
+    g_histCount = 0;
+    g_histHead = 0;
+    g_layoutGood = g_layoutBad = g_moveSamples = g_fightSamples = 0;
+    g_layoutMismatch = false;
     return MOD_OK;
 }
 }
