@@ -1,6 +1,6 @@
 {
   "id": "com.example.my_mod",
-  "Enemy Tactics": "My Mod",
+  "name": "My Mod",
   "version": "@PROJECT_VERSION@",
   "author": "You",
   "description": "An example Dusklight mod"
