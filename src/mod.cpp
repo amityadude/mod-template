@@ -76,6 +76,11 @@ constexpr float kHeatSeconds = 30.0f;       // time without being hit that gives
 constexpr float kPackChance = 0.85f;        // a second Darknut swings the moment the first one guards your attack
 constexpr float kRangedLeapChance = 0.7f;   // leap-in chance (x0.1 per tick) while you use bow/boomerang/hookshot
 constexpr float kRangedWalkH = 11.5f;
+// ---- Safety switches: set one to false and rebuild if something ever misbehaves ----
+constexpr bool kUseHitHook = true;          // cancel the combo finisher / hits on a nearly-bare armor (the hit hook)
+constexpr bool kUseDodgeJumps = true;       // the armor-off dodge jumps (calls the game's own initChaseL)
+constexpr int kComboGap = 36;               // ticks between swings that still count as one combo (1.2 s)
+constexpr int kComboCancel = 4;             // the 4th swing of your combo is the one it refuses to be staggered by
 constexpr int kStreakForget = 150;          // ticks without a read before the streak resets
 constexpr int kExposeTicks = 24;            // your opening after kStreakMax reads (1.2 s)
 // ---- Dodging (armor-off Darknut; needs the dodge-jump hook) ----
@@ -176,6 +181,9 @@ bool g_prevSwinging = false;
 bool g_prevLinkAtk = false;
 int g_sinceAtkStart = 1000;
 int g_sinceAtkEnd = 1000;
+// Your combo swing number. Counted here on purpose: the game's own combo counter sits one byte off in the
+// Dusklight fork this mod runs on, so reading it from this mod gives the wrong value.
+int g_combo = 0;
 AType g_hist[cfg::kHistorySize] = {};
 int g_histCount = 0;
 int g_histHead = 0;
@@ -424,7 +432,8 @@ bool try_read(TN* t, Mem& m, const fopAc_ac_c* plr, AType type, St st, float dis
             return false;
         }
     }
-    const bool canDodge = g_jumpHook && TnInitChaseL::g_orig != nullptr && !h_mode(t);
+    // No dodge from inside the game's own guard animation: that state is left to the game.
+    const bool canDodge = g_jumpHook && TnInitChaseL::g_orig != nullptr && !h_mode(t) && st != St::Guard;
     if (type == AType::Bash && !canDodge) {
         return false;  // a bash is meant to break its guard: only a dodge makes sense
     }
@@ -517,6 +526,7 @@ void reset_link_state() {
     g_prevLinkAtk = false;
     g_sinceAtkStart = 1000;
     g_sinceAtkEnd = 1000;
+    g_combo = 0;
 }
 
 constexpr u32 kHitMask = u32(AT_TYPE_NORMAL_SWORD) | u32(AT_TYPE_MASTER_SWORD) | u32(AT_TYPE_SHIELD_ATTACK) |
@@ -545,8 +555,7 @@ HookAction on_at_tg_hit(ModContext*, void* args, void*, void*) {
         return HOOK_CONTINUE;
     }
     auto* t = static_cast<TN*>(dst);
-    const auto* py = static_cast<daPy_py_c*>(plr);
-    const bool cancel = h_mode(t) ? (t->mNextBreakPart >= 11) : (py->getCutCount() >= 3);
+    const bool cancel = h_mode(t) ? (t->mNextBreakPart >= 11) : (g_combo >= cfg::kComboCancel);
     if (cancel) {
         g_stats.negated++;
         return HOOK_SKIP_ORIGINAL;
@@ -578,8 +587,15 @@ void tick() {
     const bool attackStart = procStart || flagStart;
     const AType startType = (atype != AType::None) ? atype : AType::Slash;
     if (attackStart) {
+        if (startType == AType::Slash) {
+            g_combo = (g_sinceAtkStart <= cfg::kComboGap) ? g_combo + 1 : 1;
+        } else {
+            g_combo = 0;
+        }
         g_sinceAtkStart = 0;
         remember_attack(startType);
+    } else if (g_sinceAtkStart > cfg::kComboGap + 20 && !swinging) {
+        g_combo = 0;
     }
     const bool rollStart = (proc == daAlink_c::PROC_FRONT_ROLL || proc == daAlink_c::PROC_SIDE_ROLL ||
                             proc == daAlink_c::PROC_BACK_JUMP) && proc != g_prevProc;
@@ -680,6 +696,9 @@ void tick() {
         if (st == St::Attack) {
             m.chainAge = 0;
         } else {
+            if (m.hold > 0 && t->mpModelMorf2 != nullptr && t->mpModelMorf2->getPlaySpeed() < 0.1f) {
+                t->mpModelMorf2->setPlaySpeed(1.0f);  // the swing was interrupted mid-hold: never leave it frozen
+            }
             m.holdDone = false;
             m.hold = 0;
             m.speeded = false;     // the game started its next swing by itself: boost that one too
@@ -888,12 +907,16 @@ void tick() {
 
 extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError*) {
-    const ModResult hr = mods::hook::add_pre<AtTgHit>(on_at_tg_hit);
-    g_hitHook = (hr == MOD_OK);
-    const ModResult jr = mods::hook::install<TnInitChaseL>();
-    g_jumpHook = (jr == MOD_OK) && TnInitChaseL::g_orig != nullptr;
+    if (cfg::kUseHitHook) {
+        const ModResult hr = mods::hook::add_pre<AtTgHit>(on_at_tg_hit);
+        g_hitHook = (hr == MOD_OK);
+    }
+    if (cfg::kUseDodgeJumps) {
+        const ModResult jr = mods::hook::install<TnInitChaseL>();
+        g_jumpHook = (jr == MOD_OK) && TnInitChaseL::g_orig != nullptr;
+    }
     mods::log::info(
-        "darknut_ruthless v6 initialized | combo-finisher hook {} | dodge-jump hook {} | status line every 5 s "
+        "darknut_ruthless v7 initialized | combo-finisher hook {} | dodge-jump hook {} | status line every 5 s "
         "near a Darknut{}",
         g_hitHook ? "ON" : "UNAVAILABLE", g_jumpHook ? "ON" : "UNAVAILABLE",
         (g_hitHook && g_jumpHook)
