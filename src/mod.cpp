@@ -1,369 +1,216 @@
-// Darknut Ruthless v12 (agile armor-off duelist, 7 more tactics; earlier notes below are from v1): makes every Darknut (the Temple of Time mini-boss and the Hyrule Castle ones) read
-// your attacks, block or dodge them, and punish every miss. Nothing else in the game is touched, and the
-// Darknut's health is never changed (it keeps its normal armor-break / damage rules).
+// Lizalfos Nightmare v1 - a fighting-game duelist built out of the Lizalfos's own states. Health is never touched.
 //
-// How it "reads" you:
-//   * The moment you PRESS an attack (Link's move id changes), every Darknut that can see it rolls to read it
-//     (82% to start, up to 96% when you keep repeating the same move). On a read it snaps to face you, raises
-//     its shield from every angle for about 0.8 s, and (armor-off Darknut) may instead leap back or sideways
-//     using its own dodge jumps. It uses the game's own guard / dodge states, so animations and sounds are
-//     the normal ones.
-//   * After 4 blocks in a row it drops its guard for about 1.2 s. That is your opening: the mod stays
-//     beatable. Landing any hit resets its streak. (Change kStreakMax / kExposeTicks to taste.)
-//   * Counter: when your swing ends, it strikes back within ~0.15 s, then chains up to 2 more swings
-//     without waiting for its recovery. It also attacks on its own whenever you are in reach and not
-//     swinging, closes distance with its leap and walks/circles faster.
-//   * It keeps its own rules for the things only a skilled player can do: the 4th hit of a combo, shield
-//     bashes and the helm splitter still work as in the normal game when it is exposed.
+// HOW IT WORKS
+//   The whole brain runs from a PRE hook and a POST hook on the Lizalfos's own update function
+//   (src/d/actor/d_a_e_dn.cpp#daE_DN_Execute). The PRE hook runs immediately before that Lizalfos's update, so
+//   every field it writes is consumed by the update that follows (its hit check is the first thing that runs in
+//   there). The POST hook runs right after the update and before collision resolves at the end of the frame.
+//   Link is tracked once per frame in mod_update (which runs before actors) from Link's move id only: no combo
+//   or cut counters are ever read.
 //
-// Logs: the first line at start-up says whether the two game hooks installed. While a Darknut is near, a status
-// line appears every 5 seconds in the Logs window. 30 ticks = 1 second. All tunables are in namespace cfg.
+//   The mod only WRITES: action, mode, timer[], invulnerability_timer, the two guard-entry fields, play speed,
+//   speedF, and (POST) the attack POWER of its sword sphere. It never writes a position, a hitbox shape or health.
+//   It calls no game function: the only game code that runs is the hooked update itself. If the hook service is
+//   missing the mod loads and does nothing (and says so in the log).
+//
+// BUILD NOTE: compile-checked against BOTH header trees (upstream v2.0.2 and the kamilink fork), see
+//   REPORT.md. Every number below lives in namespace cfg.
+//
+// 30 game ticks = 1 second. "Real" seconds below use the wall clock.
 
 #include "mods/service.hpp"
 #include "mods/svc/hook.hpp"
 #include "mods/svc/log.hpp"
 
-#include "SSystem/SComponent/c_cc_d.h"
-#include "SSystem/SComponent/c_cc_s.h"
-#include "d/d_cc_d.h"
 #include "d/actor/d_a_alink.h"
-#include "d/actor/d_a_b_tn.h"
+#include "d/actor/d_a_e_dn.h"
 #include "d/d_com_inf_game.h"
-#include "f_op/f_op_actor_iter.h"
 #include "f_op/f_op_actor_mng.h"
-#include "f_pc/f_pc_name.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <unordered_map>
-#include <vector>
 
 DEFINE_MOD();
 
 IMPORT_SERVICE(LogService, svc_log);
-IMPORT_OPTIONAL_SERVICE(HookService, svc_hook);  // optional: without it the mod runs without dodge jumps / combo-finisher block
+IMPORT_OPTIONAL_SERVICE(HookService, svc_hook);
+
+DEFINE_HOOK_SYMBOL("src/d/actor/d_a_e_dn.cpp#daE_DN_Execute", int(e_dn_class*), DnExecute);
+
+#define LZ_VERSION "Lizalfos Nightmare v1"
 
 namespace cfg {
-// ---- Reading your moves ----
-constexpr float kReadBase = 0.92f;          // chance to read a move it has no history for
-constexpr float kReadHabitBonus = 0.12f;    // extra chance when you keep repeating one move
-constexpr float kReadMax = 0.99f;
-constexpr float kReadRange = 520.0f;        // it reads swings started within this distance of it
-constexpr float kReadRangeWide = 600.0f;    // spins, jump strikes, down thrust, helm splitter
-constexpr float kReadLinkFacingCos = -0.1f; // narrow moves: you must be swinging roughly toward it
-constexpr int kReadCooldown = 5;
-constexpr float kRecoveryReadMult = 0.95f;  // reading while it is still recovering from its own swing
-constexpr int kArmTicks = 24;               // how long a read keeps the guard up (0.8 s)
-constexpr int kStreakMax = 6;               // reads in a row before it drops its guard
-constexpr int kStreakMaxL = 10;           // armor-off: reads in a row before it drops its guard
-// ---- v11: the armor-off phase is an agile duelist: fewer guards, more dodging, much faster, almost no openings ----
-constexpr float kReadBaseL = 0.62f;         // chance it reacts to a swing at all (armor off); the rest of your swings connect
-constexpr float kReadMaxL = 0.85f;
-constexpr int kReadCooldownL = 3;
-constexpr int kArmTicksL = 10;              // armor-off guard lasts only 0.33 s: it does not turtle
-constexpr float kYorokeCancelFrame = 4.0f;  // your jump strike / 4th hit staggers it; it recovers after this many frames
-constexpr float kYorokeDodge = 0.5f;        // ... and then dodges aside (else it swings straight back)
-constexpr float kHitRunChance = 0.6f;       // after its swing it jumps aside instead of standing in your counter
-constexpr float kHoldChanceL = 0.2f;        // armor-off wind-up holds (fewer: this is a fast fight)
-constexpr int kHoldMinL = 4, kHoldMaxL = 8;   // a half-beat delay, 0.13-0.27 s
-// ---- v12 ----
-constexpr float kFastSwingChance = 0.4f;    // mixed timing: this share of its swings come out extra fast ...
-constexpr float kFastSwingMult = 1.3f;      // ... at this extra speed
-constexpr int kDoubleDodgeTicks = 25;       // you attack again within this long after it dodged: it dodges again
-constexpr float kRollRush = 0.85f;          // you rolled / backflipped out of reach: it leaps in and swings
-constexpr float kChargeRush = 0.5f;         // per tick while you charge a spin from a distance
-constexpr float kChargePunishL = 0.7f;      // per tick while you charge a spin in its reach (armor off)
-constexpr int kFlurryChain = 3;             // at full rage: extra swings in one burst, then it jumps away
-constexpr float kPressureChanceL = 0.9f;
-constexpr float kPressureRangeL = 480.0f;
-constexpr float kStunCancelFrameL = 5.0f;   // armor-off: it shakes off a hit after this many animation frames (was 12)
-constexpr float kStunCancelMinL = 3.0f;     // ... and at full rage after this many
-// ---- v4: mind games ----
-constexpr float kHoldChance = 0.7f;         // chance a swing is held back in its wind-up (so you cannot time a dodge)
-constexpr int kHoldMin = 3;                 // ticks (0.1 s)
-constexpr int kHoldMax = 12;                // ticks (0.4 s)
-constexpr float kBreakerChance = 0.45f;     // per tick while you hold your shield up and it is in kick range
-constexpr float kBreakerRange = 230.0f;
-constexpr float kHabitShare = 0.6f;         // this share of your last 12 moves being the same = "you are repeating"
-constexpr int kHabitMinSamples = 6;
-constexpr int kHotTicks = 60;
-constexpr float kPunishChance = 0.85f;      // it strikes the moment you roll / backflip near it (both phases)
-constexpr float kChargePunish = 0.25f;      // per tick while you charge a spin attack near it
-constexpr int kBiasMax = 4;                 // how well it learns which way you dodge
-constexpr int kBiasAge = 120;
-constexpr int kBiasTurn = 0x1200;           // it aims its swing this far toward your favourite dodge side
-constexpr float kHeatSeconds = 30.0f;       // time without being hit that gives full pressure
-constexpr float kPackChance = 0.85f;        // a second Darknut swings the moment the first one guards your attack
-constexpr float kRangedLeapChance = 0.7f;   // leap-in chance (x0.1 per tick) while you use bow/boomerang/hookshot
-constexpr float kRangedWalkH = 11.5f;
-// ---- Safety switches: set one to false and rebuild if something ever misbehaves ----
-constexpr bool kUseHitHook = false;         // OFF by design: with this on, some of your hits were cancelled. Now every hit connects.
-constexpr bool kUseDodgeJumps = true;       // the armor-off dodge jumps (calls the game's own initChaseL)
-constexpr int kComboGap = 36;               // ticks between swings that still count as one combo (1.2 s)
-constexpr int kComboCancel = 4;             // the 4th swing of your combo is the one it refuses to be staggered by
-constexpr int kStreakForget = 150;          // ticks without a read before the streak resets
-constexpr int kExposeTicks = 24;            // your opening after kStreakMax reads (0.8 s)
-constexpr int kExposeTicksL = 4;            // armor off: almost no opening (0.13 s)
-// ---- Dodging (armor-off Darknut; needs the dodge-jump hook) ----
-constexpr float kEvadeBackSlash = 0.35f, kEvadeSideSlash = 0.45f;
-constexpr float kEvadeBackJump = 0.55f, kEvadeSideJump = 0.40f;
-constexpr float kEvadeBackWide = 0.70f;     // spin / great spin / down thrust
-constexpr float kEvadeSideHead = 0.75f;     // helm splitter
-constexpr float kEvadeBackBash = 0.9f;      // shield bash (it never guards a bash: that would stun it)
-// ---- Offense ----
-constexpr float kRiposteChance = 0.92f;
-constexpr int kRiposteDelay = 1;            // ticks after your swing ends
-constexpr int kRiposteWindow = 26;          // it keeps trying for this long if it is busy
-constexpr float kRiposteRange = 430.0f;
-constexpr float kPressureRange = 380.0f;
-constexpr float kPressureChance = 0.65f;    // per tick while ready and in reach
-constexpr int kAttackGapH = 14;             // minimum ticks between its own attack starts (armored)
-constexpr int kAttackGapL = 2;              // (armor off)
-constexpr float kLinkReach = 260.0f;        // do not walk into a swing that is already reaching it
-constexpr int kChainMax = 4;                // extra swings without waiting for its recovery (armored)
-constexpr int kChainMaxL = 8;               // armor off
-constexpr float kChainChance = 0.97f;
-constexpr float kChainRange = 380.0f;
-constexpr float kAttackSpeedMult = 1.4f;    // wind-up speed (1.0 = normal)
-constexpr float kAttackSpeedMultL = 1.8f;   // armor off
-constexpr int kMaxGameCooldown = 6;        // clamps the game's own attack timer (normally 75-175 ticks)
-constexpr float kLeapMin = 350.0f;          // armor-off gap closer
-constexpr float kLeapMax = 900.0f;
-constexpr float kLeapChance = 0.5f;
-constexpr float kLeapIdleL = 0.5f;          // leap-in chance multiplier when you just back away (was 0.1)
-constexpr int kLeapCooldown = 45;
-// ---- Footwork ----
-constexpr int kTurnStep = 0x1000;           // max turn per tick toward you (the game turns ~0x160-0x800)
-constexpr float kTurnRange = 700.0f;
-constexpr float kEngageRange = 1400.0f;
-constexpr float kWalkSpeedH = 8.5f;         // armored walk (game: 4.3), approach (2.3 -> 4.4)
-constexpr float kApproachSpeedH = 6.0f;
-constexpr float kWalkSpeedL = 12.0f;        // armor-off walk (game: 4.7)
-constexpr float kStrafeSpeedL = 11.0f;      // armor-off circling (game: 4.8)
-constexpr float kDamageMultH = 1.5f;       // its sword damage while armored (game: 4 = one heart)
-constexpr float kDamageMultL = 3.0f;       // armor off (game: 2 -> 6 = a heart and a half)
-// ---- v8: armor-off rage: every hit you land on the armor-off Darknut makes it fiercer (its health is untouched) ----
-constexpr float kRageHits = 3.0f;           // hits that give full rage
-constexpr int kRageStartHits = 2;           // it starts at two-thirds rage the moment its armor comes off
-constexpr float kRageAttackSpeed = 0.4f;    // extra wind-up speed at full rage
-constexpr float kRageGap = 0.4f;            // attack gap shrinks by this share at full rage
-constexpr int kRageChain = 2;               // extra chained swings at full rage
-constexpr float kRageExpose = 0.5f;         // your opening shrinks by this share at full rage
-constexpr int kRageStreak = 4;              // extra reads in a row before it drops its guard
-constexpr float kRageDamage = 0.5f;         // extra damage multiplier at full rage
-constexpr float kShakeCounter = 1.0f;       // you hit it, it shakes the hit off and swings back at once (+0.3 at full rage)
-constexpr float kGuardCounter = 1.0f;       // it blocks your swing, leaves its guard early and swings back (+0.3 at full rage)
-constexpr float kGuardCancelFrameL = 8.0f;  // armor off: how long it holds the guard animation after your swing ends
-constexpr int kLandingRange = 150;
-// ---- v10: more tactics ----
-constexpr float kPostMoveStrike = 1.0f;     // after any dodge-jump / leap it swings the moment it lands
-constexpr int kFinishTicks = 60;            // after YOU take a hit it attacks with no pause for this long (1.5 s)
-constexpr int kFinishChain = 3;             // ... and chains this many extra swings
-constexpr float kZoneChance = 0.4f;         // per tick while you walk up to it: it steps back, then strikes as you follow
-constexpr float kZoneMin = 260.0f, kZoneMax = 430.0f;
-constexpr float kZoneApproach = 4.0f;       // you must be closing this many units per tick
-constexpr int kZoneCooldown = 45;
-constexpr float kStutterChance = 0.0f;      // off: no more stopping dead (this is a fast fight)
-constexpr int kStutterMin = 5, kStutterMax = 12;
-constexpr int kBurstTicks = 10;
-constexpr float kBurstSpeedL = 15.0f;
-constexpr float kStutterMinDist = 320.0f, kStutterMaxDist = 900.0f;
-constexpr float kLandedBias = 0.12f;        // a move that got through makes it dodge that move more (per hit, max 3)
-constexpr float kLandedBiasMax = 0.36f;
-constexpr int kLandedAge = 600;             // ticks (20 s) for one of those memories to fade          // after your jump strike / helm splitter it punishes from further away
-constexpr int kHistorySize = 12;
-constexpr int kStatusTicks = 150;
+// ---- switches (one per risky feature) ----
+constexpr bool kEnableReads = true;      // read your moves the moment you start them
+constexpr bool kEnablePatterns = true;   // 16 moves / 8 dodge sides / 8 spacings of memory
+constexpr bool kEnableMemory = true;     // 30 s memory of what got through, bait for what was blocked
+constexpr bool kEnablePunish = true;     // counters, roll / backflip / item / stillness / turtle punishes
+constexpr bool kEnableChains = true;     // chained swings, heart-loss bursts
+constexpr bool kEnableCut = true;        // end its own swing's tail early, shake off hits
+constexpr bool kEnableFeints = true;     // wind-up holds, feints into guard, stop-and-surge, fake retreats
+constexpr bool kEnablePack = true;       // the others in range swing when one reads, blocks or is hit
+constexpr bool kEnableSpeed = true;      // swing speed and movement speed
+constexpr bool kEnableDamage = true;     // attack POWER of its sword sphere (not the hitbox) x6..x8
+constexpr bool kEnableZoning = true;     // keep spacing just outside your reach
+
+// ---- reading ----
+constexpr float kReadChance = 0.99f;     // on every move
+constexpr int kReadCooldown = 1;         // ticks
+constexpr float kReadRange = 560.0f;     // ground distance
+constexpr float kAirHopChance = 0.85f;   // jump strike / helm splitter / down thrust / great spin: hop away
+constexpr float kSlashHopChance = 0.25f; // plain slashes: mostly shield
+constexpr float kWeakHopBonus = 0.50f;   // moves that got through are dodged this much more
+
+// ---- fight memory / bait ----
+constexpr float kWeakMemorySec = 30.0f;  // a move that got through is remembered this long
+constexpr int kBaitBlocks = 4;           // a move blocked this often is "abandoned" as bait...
+constexpr float kBaitChance = 0.50f;     // ...with this chance, once
+constexpr int kMoveHistory = 16;         // at most 16
+constexpr int kDodgeHistory = 8;         // at most 8
+constexpr int kSpaceHistory = 8;         // at most 8
+constexpr int kPatternMax = 6;           // repeat streak at which it stops getting harder to read
+constexpr float kSpaceBucket = 100.0f;   // distance bucket size for the spacing pattern
+
+// ---- rage / heat / last stand ----
+constexpr float kRageStart = 0.60f;
+constexpr float kRageAfterHit = 1.00f;   // one hit takes it to full rage; rage never decays within a fight
+constexpr float kFightIdleSec = 12.0f;   // no Lizalfos engaged this long = a new fight (rage resets)
+constexpr float kHeatRampSec = 25.0f;    // seconds without being hit until heat is full
+constexpr float kHeatLowHearts = 0.5f;   // below this fraction of hearts heat gets extra
+constexpr int kLastStandHealth = 40;     // reads its health only; at or below this it is in last-stand mode
+
+// ---- damage (attack power of its sword sphere, scaled after the game wrote it) ----
+constexpr float kDamageMult = 6.0f;
+constexpr float kDamageMultRage = 8.0f;  // at full rage
+constexpr int kAtpMax = 120;
+
+// ---- swing speed (animation play speed, never 0) ----
+constexpr float kSwingSpeed = 2.0f;
+constexpr float kSwingRageBonus = 0.6f;  // at full rage
+constexpr float kSwingLastStandBonus = 0.4f;
+constexpr float kSwingCap = 4.0f;        // cap on the multiplier
+constexpr float kSwingRateCap = 5.5f;    // cap on frames per tick: the narrowest damage window is 6 frames wide
+constexpr float kMinPlaySpeed = 0.05f;   // never exactly 0
+
+// ---- tempo ----
+constexpr int kAttackGap = 2;            // ticks between its own attacks (cap on the game's attack timer)
+constexpr int kChainMax = 10;
+constexpr int kBurstChainBonus = 6;
+constexpr float kBurstSec = 3.0f;        // after you lose a heart: this long with no pause
+constexpr float kChainRange = 460.0f;
+constexpr int kChainReset = 75;          // ticks without a swing and the chain count resets
+constexpr int kCounterWindow = 24;       // ticks in which it will strike back after a read / block / shake-off
+constexpr float kPunishRange = 470.0f;
+constexpr int kShakeTicks = 3;           // it shakes off a small hit after this many ticks (about 3 animation frames)
+// frames after which the harmless tail of each swing is cut short (the hit windows are 13-18, 22-28, 25-30, 33-41)
+constexpr float kCutFrameAttack0 = 30.0f;
+constexpr float kCutFrameAttack = 32.0f;
+constexpr float kCutFrameTail = 44.0f;
+
+// ---- feints / bait / zoning ----
+constexpr float kFeintBase = 0.20f;
+constexpr float kFeintPerPattern = 0.08f;
+constexpr float kFeintMax = 0.60f;
+constexpr int kFeintHold = 8;            // ticks the wind-up is held (play speed kMinPlaySpeed)
+constexpr float kFeintFrame = 9.0f;      // held in the first frames of the swing
+constexpr float kStopSurgeChance = 0.015f; // per tick while running at you
+constexpr int kStopTicks = 5;
+constexpr int kSurgeTicks = 14;
+constexpr float kZoneMin = 190.0f;       // closer than this with you idle: it steps back out of reach
+constexpr float kZoneChance = 0.05f;     // per tick
+constexpr int kStillFrames = 18;         // you stood still this many frames (mod_update calls) and it swings
+constexpr float kTurtleSec = 2.2f;       // you have not attacked for this long inside its range: tail sweep
+constexpr float kTurtleRange = 330.0f;
+
+// ---- movement (absolute speeds, never stacked) ----
+constexpr float kRunBase = 40.0f;        // the fork's dash speed
+constexpr float kStrafeBase = 7.5f;      // its strafe hop speed
+constexpr float kMoveMult = 2.5f;
+constexpr float kSpeedCap = 75.0f;       // a hard cap; above this it can step through thin walls
+constexpr float kBrakeMargin = 90.0f;    // never moves farther in one tick than (distance - this)
+constexpr s16 kFaceTolerance = 0x1000;   // only boosts the run while it is pointing at you
+
+// ---- pack ----
+constexpr float kPackRange = 700.0f;
+
+// ---- self-check ----
+constexpr int kLayoutBadLimit = 12;
+constexpr float kEngageRange = 1800.0f;
+constexpr float kStatusSec = 5.0f;
+constexpr float kPruneSec = 6.0f;
 }  // namespace cfg
 
-// Game hooks (declared at file scope).
-// ---- Calling the game's own dodge-jump setup, through a pass-through hook (no link dependency) ----
-DEFINE_HOOK_SYMBOL("daB_TN_c::initChaseL", void(daB_TN_c*, int), TnInitChaseL);
-// ---- The game's hit code: used only to cancel hits the guard cannot take on its own ----
-DEFINE_HOOK_SYMBOL("cCcS::SetAtTgCommonHitInf", void(cCcS*, cCcD_Obj*, cCcD_Obj*, cXyz*), AtTgHit);
+static_assert(cfg::kMoveHistory >= 1 && cfg::kMoveHistory <= 16, "move history is 1..16");
+static_assert(cfg::kDodgeHistory >= 1 && cfg::kDodgeHistory <= 8, "dodge history is 1..8");
+static_assert(cfg::kSpaceHistory >= 1 && cfg::kSpaceHistory <= 8, "space history is 1..8");
 
-namespace {
+// ---------------------------------------------------------------------------------------------------------------
+// The Lizalfos's own action numbers (the enum is file-local in d_a_e_dn.cpp, identical in both trees)
+namespace lz {
+constexpr s16 NORMAL = 0, FIGHT_RUN = 3, ATTACK_0 = 4, ATTACK = 5, TAIL_ATTACK = 6, GUARD = 7, JUMP = 8, DRAWBACK = 12,
+              S_DAMAGE = 20, DAMAGE = 21;
+}
 
-using TN = daB_TN_c;
+using Clock = std::chrono::steady_clock;
+static double now_sec() {
+    return std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+}
 
-enum class AType { None, Slash, Jump, Spin, Down, Head, Large, Bash };
-enum class St { Ready, Guard, Attack, Hurt, Other };
-
-struct Mem {
-    int armed = 0;        // ticks left in the current read
-    int readCd = 0;
-    int streak = 0;       // reads in a row
-    int streakAge = 0;
-    int expose = 0;       // ticks left of your opening
-    int atkCd = 0;        // ticks until it may start another attack on its own
-    int chain = 0;        // swings chained without a break
-    int chainAge = 0;
-    bool chainRolled = false;
-    int leapCd = 0;
-    int riposteIn = -1;   // ticks until the riposte window opens
-    int riposteTry = 0;   // ticks left of the riposte window
-    bool speeded = false;
-    bool lastHurt = false;
-    bool seen = false;
-    int hold = 0;
-    float savedRate = 1.0f;
-    bool holdDone = false;
-    int hot = 0;          // you are repeating a move: it counters harder
-    int bias = 0;         // + = you dodge toward its yaw-positive side, - = the other
-    int biasAge = 0;
-    int hits = 0;         // hits you have landed on it since it lost its armor (drives its rage)
-    bool rageInit = false;
-    int zoneCd = 0;
-    float prevDist = -1.0f;
-    int stutter = 0;
-    int burst = 0;
-    int sinceDodge = 1000;  // ticks since it last dodged
-};
-
-struct Stats {
-    int read = 0, guard = 0, evade = 0, negated = 0, landed = 0, riposte = 0, pressure = 0, chain = 0,
-        leap = 0, opening = 0, breaker = 0, held = 0, habit = 0, punish = 0, pack = 0, counter = 0, landing = 0, finish = 0, zone = 0, stutter = 0, hitrun = 0, rush = 0, doubled = 0, jumpdodge = 0;
-};
-
-std::unordered_map<const void*, Mem> g_mem;
-Stats g_stats;
-int g_statTicks = 0;
-int g_tick = 0;
-int g_logBudget = 80;
-bool g_hitHook = false;
-bool g_jumpHook = false;
-bool g_readThisTick = false;
-int g_sinceLanded = 0;
-float g_heat = 0.0f;
-float g_rageSeen = 0.0f;   // highest armor-off rage in the last status interval (for the status line)
-
-// Link's attack bookkeeping
-u16 g_prevProc = 0;
-bool g_prevSwinging = false;
-bool g_prevLinkAtk = false;
-int g_sinceAtkStart = 1000;
-int g_sinceAtkEnd = 1000;
-// Your combo swing number. Counted here on purpose: the game's own combo counter sits one byte off in the
-// Dusklight fork this mod runs on, so reading it from this mod gives the wrong value.
-int g_combo = 0;
-AType g_lastAtype = AType::None;   // what your last attack was
-int g_linkHurt = 0;                // ticks left of its "you just got hit" pressure window
-int g_prevLife = -1;
-int g_landedBy[8] = {};            // how often each of your move types got through its defence lately
-int g_landedAge = 0;
-AType g_hist[cfg::kHistorySize] = {};
-int g_histCount = 0;
-int g_histHead = 0;
-
-uint32_t g_rng = 2463534242u;
-
-constexpr float kPi = 3.14159265358979f;
-constexpr float kAngleToRad = kPi / 32768.0f;  // game angles: 65536 = full circle
-
-float rand01() {
+static uint32_t g_rng = 0x2F6E2B1u;
+static float rand01() {
     g_rng ^= g_rng << 13;
     g_rng ^= g_rng >> 17;
     g_rng ^= g_rng << 5;
     return (g_rng & 0xFFFFFF) / float(0x1000000);
 }
-
-float clampf(float v, float lo, float hi) {
-    return v < lo ? lo : (v > hi ? hi : v);
+static float clampf(float x, float lo, float hi) {
+    return std::max(lo, std::min(hi, x));
 }
 
-float dist_xz(const fopAc_ac_c* a, const fopAc_ac_c* b) {
-    const float dx = a->current.pos.x - b->current.pos.x;
-    const float dz = a->current.pos.z - b->current.pos.z;
+// The game's own wrappers (dComIfGp_getPlayer, dComIfGp_event_runCheck, dComIfGs_getLife, dComIfGs_getMaxLife) and
+// dCcD_GObjInf::ChkTgHit are declared NOINLINE, so calling them would call INTO the game. These read the same
+// members straight out of the game's global data instead (g_dComIfG_gameInfo), and the collider's own inline flag
+// check. Their offsets are measured in both header trees in REPORT.md.
+static fopAc_ac_c* player_ptr() {
+    return g_dComIfG_gameInfo.play.getPlayer(0);
+}
+static bool event_running() {
+    return g_dComIfG_gameInfo.play.getEvent()->runCheck() != 0;
+}
+static int life_now() {
+    return g_dComIfG_gameInfo.info.getPlayer().getPlayerStatusA().getLife();
+}
+static int max_life_now() {
+    return g_dComIfG_gameInfo.info.getPlayer().getPlayerStatusA().getMaxLife();
+}
+static bool tg_hit(const dCcD_Sph& s) {
+    return s.cCcD_ObjHitInf::ChkTgHit() != 0;
+}
+
+static float dist_xz(const fopAc_ac_c& a, const fopAc_ac_c& b) {
+    const float dx = a.current.pos.x - b.current.pos.x;
+    const float dz = a.current.pos.z - b.current.pos.z;
     return std::sqrt(dx * dx + dz * dz);
 }
-
-// Yaw (game angle) that points from `from` toward `to`.
-s16 angle_to(const fopAc_ac_c* from, const fopAc_ac_c* to) {
-    const float dx = to->current.pos.x - from->current.pos.x;
-    const float dz = to->current.pos.z - from->current.pos.z;
-    const int a = static_cast<int>(std::lround(std::atan2(dx, dz) / kAngleToRad));
-    return static_cast<s16>(static_cast<uint16_t>(a & 0xFFFF));
+static s16 angle_to(const fopAc_ac_c& from, const fopAc_ac_c& to) {
+    const float dx = to.current.pos.x - from.current.pos.x;
+    const float dz = to.current.pos.z - from.current.pos.z;
+    return static_cast<s16>(static_cast<int>(std::atan2(dx, dz) * (32768.0f / 3.14159265f)));
 }
 
-int angle_gap(const TN* t, s16 target) {
-    return std::abs(static_cast<int>(static_cast<s16>(target - t->shape_angle.y)));
-}
+// ---------------------------------------------------------------------------------------------------------------
+// Link, tracked from his move id only
+enum class AType : uint8_t { None, Slash, Jump, Spin, Down, Head, Large, Bash };
 
-void turn_toward(TN* t, s16 target, int maxStep) {
-    const int diff = static_cast<int>(static_cast<s16>(target - t->shape_angle.y));
-    const int step = std::clamp(diff, -maxStep, maxStep);
-    t->shape_angle.y = static_cast<s16>(t->shape_angle.y + step);
-}
-
-bool h_mode(const TN* t) {
-    return t->mActionMode1 < TN::ACT_CHANGEDEMO;  // armored (the shield-and-armor phase)
-}
-
-St classify(const TN* t) {
-    switch (t->mActionMode1) {
-    case TN::ACT_CHASEH: return St::Ready;
-    case TN::ACT_CHASEL: {
-        const int m2 = t->mActionMode2;
-        return (m2 <= 5 || m2 == 16) ? St::Ready : St::Other;  // not mid-leap
-    }
-    case TN::ACT_GUARDH:
-    case TN::ACT_GUARDL: return St::Guard;
-    case TN::ACT_ATTACKH:
-    case TN::ACT_ATTACKSHIELDH:
-    case TN::ACT_ATTACKL:
-    case TN::ACT_ATTACKSHIELDL: return St::Attack;
-    case TN::ACT_DAMAGEH:
-    case TN::ACT_DAMAGEL:
-    case TN::ACT_YOROKE: return St::Hurt;
-    default: return St::Other;  // demos, waiting, ending
-    }
-}
-
-// Its own swing is past the part that can hurt you and is only recovering.
-bool in_recovery(const TN* t) {
-    if (t->mpModelMorf2 == nullptr) {
-        return false;
-    }
-    const float f = t->mpModelMorf2->getFrame();
-    const int m2 = t->mActionMode2;
-    if (t->mActionMode1 == TN::ACT_ATTACKH) {
-        if (m2 == 1) {
-            return f >= 41.0f;
-        }
-        if (m2 == 2) {
-            return f >= 37.0f;
-        }
-    } else if (t->mActionMode1 == TN::ACT_ATTACKL) {
-        if (m2 == 1 || m2 == 101) {
-            return f >= 14.5f;  // the sword hitbox turns off at frame 14
-        }
-        if (m2 == 2 || m2 == 102) {
-            return f >= 38.5f;  // ... at frame 38
-        }
-    }
-    return false;
-}
-
-// 0 = calm, 1 = full rage. Armor off only.
-float rage_of(const TN* t, const Mem& m) {
-    if (h_mode(t)) {
-        return 0.0f;
-    }
-    return clampf(float(m.hits) / cfg::kRageHits, 0.0f, 1.0f);
-}
-
-// Same entry the game itself uses (setActionMode): two fields and the head-lock flag.
-void enter(TN* t, int mode1, int mode2) {
-    t->offHeadLockFlg();
-    t->mActionMode1 = mode1;
-    t->mActionMode2 = mode2;
-}
-
-AType attack_type_of(u16 proc) {
+static AType attack_type_of(u16 proc) {
     switch (proc) {
     case daAlink_c::PROC_CUT_NORMAL:
     case daAlink_c::PROC_CUT_FINISH:
-    case daAlink_c::PROC_CUT_FINISH_JUMP_UP: return AType::Slash;
+    case daAlink_c::PROC_CUT_FINISH_JUMP_UP:
+    case daAlink_c::PROC_CUT_REVERSE: return AType::Slash;
     case daAlink_c::PROC_CUT_JUMP: return AType::Jump;
     case daAlink_c::PROC_CUT_TURN: return AType::Spin;
     case daAlink_c::PROC_CUT_DOWN: return AType::Down;
@@ -373,855 +220,711 @@ AType attack_type_of(u16 proc) {
     default: return AType::None;
     }
 }
+static bool is_air(AType t) {
+    return t == AType::Jump || t == AType::Down || t == AType::Head || t == AType::Large;
+}
+static bool is_unblockable(AType t) {  // go around a raised shield
+    return t == AType::Head || t == AType::Down;
+}
+static bool is_roll(u16 p) {
+    return p == daAlink_c::PROC_FRONT_ROLL || p == daAlink_c::PROC_SIDE_ROLL || p == daAlink_c::PROC_ROLL_JUMP;
+}
+static bool is_item(u16 p) {
+    return p == daAlink_c::PROC_BOW_MOVE || p == daAlink_c::PROC_BOW_SUBJECT || p == daAlink_c::PROC_BOOMERANG_MOVE ||
+           p == daAlink_c::PROC_BOOMERANG_SUBJECT || p == daAlink_c::PROC_HOOKSHOT_MOVE ||
+           p == daAlink_c::PROC_HOOKSHOT_SUBJECT || p == daAlink_c::PROC_HOOKSHOT_FLY;
+}
+static bool is_charge(u16 p) {
+    return p == daAlink_c::PROC_CUT_TURN_CHARGE || p == daAlink_c::PROC_CUT_LARGE_JUMP_CHARGE;
+}
 
-const char* atype_name(AType t) {
-    switch (t) {
-    case AType::Slash: return "slash";
-    case AType::Jump: return "jump strike";
-    case AType::Spin: return "spin attack";
-    case AType::Down: return "down thrust";
-    case AType::Head: return "helm splitter";
-    case AType::Large: return "great spin";
-    case AType::Bash: return "shield bash";
-    default: return "attack";
+enum class Dodge : uint8_t { None, Front, Left, Right, Back };
+
+struct Link {
+    bool have = false;
+    u16 proc = 0;
+    AType type = AType::None;
+    bool attacking = false;
+    // events: each has a sequence number that only ever grows, so a Lizalfos that runs at a different rate than
+    // this mod can never miss one
+    uint32_t attackSeq = 0, attackEndSeq = 0, rollSeq = 0, backSeq = 0, itemSeq = 0, chargeSeq = 0;
+    AType lastType = AType::None;
+    float lastDist = 0.0f;
+    Dodge lastDodge = Dodge::None;
+    int stillFrames = 0;
+    double lastAttackAt = 0.0;
+    int life = -1, maxLife = 0;
+};
+static Link g_link;
+
+// histories
+static AType g_moves[16];
+static int g_movesN = 0, g_movesPos = 0;
+static Dodge g_dodges[8];
+static int g_dodgesN = 0, g_dodgesPos = 0;
+static int g_spaces[8];
+static int g_spacesN = 0, g_spacesPos = 0;
+static double g_weakUntil[8];  // per AType: it got through
+static int g_blocked[8];       // per AType: it was blocked
+
+template <class T>
+static int streak(const T* buf, int n, int pos, int cap) {  // how many of the newest entries equal the newest
+    if (n == 0) return 0;
+    const int newest = (pos + cap - 1) % cap;
+    int s = 1;
+    for (int i = 1; i < n; i++) {
+        if (buf[(newest + cap - i) % cap] != buf[newest]) break;
+        s++;
+    }
+    return s;
+}
+static int move_streak() { return streak(g_moves, g_movesN, g_movesPos, cfg::kMoveHistory); }
+static int dodge_streak() { return streak(g_dodges, g_dodgesN, g_dodgesPos, cfg::kDodgeHistory); }
+static int space_streak() { return streak(g_spaces, g_spacesN, g_spacesPos, cfg::kSpaceHistory); }
+static int pattern_level() {
+    if (!cfg::kEnablePatterns) return 0;
+    const int s = std::max(move_streak(), std::max(dodge_streak(), space_streak()));
+    return std::min(std::max(s - 1, 0), cfg::kPatternMax);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// fight-wide state
+static float g_rage = cfg::kRageStart;
+static double g_lastEngaged = 0.0;
+static double g_lastLinkHit = 0.0;
+static double g_burstUntil = 0.0;
+static uint32_t g_alarmSeq = 0;
+static bool g_off = false;       // layout self-check failed
+static bool g_hooksOk = false;
+static int g_good = 0, g_bad = 0;
+static double g_nextStatus = 0.0, g_nextPrune = 0.0;
+
+struct Stats {
+    int read = 0, readMiss = 0, guard = 0, hop = 0, weakHop = 0, bait = 0;
+    int counter = 0, rollPunish = 0, backPunish = 0, itemPunish = 0, chargePunish = 0, stillPunish = 0, turtle = 0;
+    int pattMove = 0, pattDodge = 0, pattSpace = 0;
+    int feint = 0, feintCancel = 0, fakeRetreat = 0, surge = 0, zone = 0;
+    int chain = 0, burst = 0, cut = 0, shake = 0, pack = 0, lastStand = 0, scaled = 0, sped = 0;
+};
+static Stats g_st;
+
+struct Mem {
+    double lastSeen = 0.0;
+    int t = 0;
+    s16 prevAction = -1;
+    uint32_t seenAttack = 0, seenEnd = 0, seenRoll = 0, seenBack = 0, seenItem = 0, seenCharge = 0, seenAlarm = 0;
+    int readCd = 0, counterArm = 0, counterTail = 0, chain = 0, sinceAtk = 999, punishCd = 0;
+    int feintHold = 0, stopTicks = 0, surgeTicks = 0, afterHop = 0, shakeT = 0, zoneCd = 0;
+    bool feinting = false;
+    float baseRate = 1.0f;
+    int baseAtp = 0, scaledAtp = 0;
+};
+static std::unordered_map<const e_dn_class*, Mem> g_mem;
+
+enum class St { Other, Ready, Attack, Guard, Shake, Hop };
+static St classify(const e_dn_class* d) {
+    switch (d->action) {
+    case lz::FIGHT_RUN: return St::Ready;
+    case lz::ATTACK_0:
+    case lz::ATTACK:
+    case lz::TAIL_ATTACK: return St::Attack;
+    case lz::GUARD: return St::Guard;
+    case lz::S_DAMAGE: return St::Shake;
+    case lz::DRAWBACK: return St::Hop;
+    default: return St::Other;
     }
 }
 
-bool wide_move(AType t) {
-    return t == AType::Spin || t == AType::Down || t == AType::Large || t == AType::Jump || t == AType::Head;
+// ---------------------------------------------------------------------------------------------------------------
+// forced states. Each one is the entry the game itself uses (see REPORT.md for the line-by-line proof).
+static void force_guard(e_dn_class* d, bool hop) {  // d_a_e_dn.cpp fight_run -> ACTION_GUARD
+    d->action = lz::GUARD;
+    d->mode = hop ? 0 : 5;
+    d->field_0x708 = 30.0f;
+    d->field_0x70c = d->actor.shape_angle.y;
+    d->timer[0] = 0;
+    d->invulnerability_timer = 15;
+}
+static void force_hop(e_dn_class* d) {  // ACTION_DRAWBACK mode 0 (sets its own invulnerability)
+    d->action = lz::DRAWBACK;
+    d->mode = 0;
+}
+static void force_attack(e_dn_class* d, s16 which) {  // ACTION_ATTACK_0 / ATTACK / TAIL_ATTACK mode 0
+    d->action = which;
+    d->mode = 0;
+}
+static void force_run(e_dn_class* d) {  // ACTION_FIGHT_RUN mode 0
+    d->action = lz::FIGHT_RUN;
+    d->mode = 0;
+}
+static s16 pick_attack(float dist, int variety) {
+    if (variety == 1) return lz::TAIL_ATTACK;
+    return dist < 300.0f ? lz::ATTACK_0 : lz::ATTACK;
 }
 
-void remember_attack(AType t) {
-    g_hist[g_histHead] = t;
-    g_histHead = (g_histHead + 1) % cfg::kHistorySize;
-    if (g_histCount < cfg::kHistorySize) {
-        g_histCount++;
+// ---------------------------------------------------------------------------------------------------------------
+// frame-level helpers
+static float swing_mult(bool lastStand) {
+    const float rageN = clampf((g_rage - cfg::kRageStart) / (1.0f - cfg::kRageStart), 0.0f, 1.0f);
+    float m = cfg::kSwingSpeed + cfg::kSwingRageBonus * rageN;
+    if (lastStand) m += cfg::kSwingLastStandBonus;
+    return std::min(m, cfg::kSwingCap);
+}
+static float damage_mult() {
+    const float rageN = clampf((g_rage - cfg::kRageStart) / (1.0f - cfg::kRageStart), 0.0f, 1.0f);
+    return cfg::kDamageMult + (cfg::kDamageMultRage - cfg::kDamageMult) * rageN;
+}
+static float heat_now() {
+    const double now = now_sec();
+    float h = clampf(float((now - g_lastLinkHit) / cfg::kHeatRampSec), 0.0f, 1.0f);
+    if (g_link.maxLife > 0 && g_link.life >= 0) {
+        const float frac = float(g_link.life) / float(g_link.maxLife);
+        if (frac < cfg::kHeatLowHearts) h = clampf(h + (cfg::kHeatLowHearts - frac) * 2.0f, 0.0f, 1.0f);
     }
+    return h;
 }
 
-float habit_share(AType t) {
-    if (g_histCount < 4) {
-        return 0.0f;
+static void raise_alarm(Mem& m) {
+    if (!cfg::kEnablePack) return;
+    g_alarmSeq++;
+    m.seenAlarm = g_alarmSeq;  // the one that raised it does not answer itself
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The brain, called from the PRE hook: runs immediately before this Lizalfos's own update.
+static void brain(e_dn_class* d) {
+    if (d->status != 0) return;
+    fopAc_ac_c* plrp = player_ptr();
+    if (plrp == nullptr || event_running()) return;
+    const fopAc_ac_c& plr = *plrp;
+    fopEn_enemy_c& me = d->actor;
+
+    // layout self-check: a real Lizalfos has a small action number, a small mode and a model
+    const bool sane = d->action >= 0 && d->action <= 64 && d->mode >= -16 && d->mode <= 64 && d->anm_p != nullptr;
+    if (sane) {
+        g_good++;
+    } else {
+        g_bad++;
+        return;  // never touch an actor whose state numbers are not real
     }
-    int n = 0;
-    for (int i = 0; i < g_histCount; i++) {
-        if (g_hist[i] == t) {
-            n++;
+    if (me.health <= 0 || d->death_flag != 0) return;
+
+    const float dist = dist_xz(me, plr);
+    if (dist > cfg::kEngageRange) return;
+    g_link.lastDist = dist;  // the spacing pattern uses the last Lizalfos the brain measured
+
+    const double now = now_sec();
+    if (now - g_lastEngaged > cfg::kFightIdleSec) {  // a new fight: rage starts over, the old chain is forgotten
+        g_rage = cfg::kRageStart;
+    }
+    g_lastEngaged = now;
+
+    Mem& m = g_mem[d];
+    if (m.t == 0) {  // first tick we see it: start level with every event counter
+        m.seenAttack = g_link.attackSeq;
+        m.seenEnd = g_link.attackEndSeq;
+        m.seenRoll = g_link.rollSeq;
+        m.seenBack = g_link.backSeq;
+        m.seenItem = g_link.itemSeq;
+        m.seenCharge = g_link.chargeSeq;
+        m.seenAlarm = g_alarmSeq;
+    }
+    m.lastSeen = now;
+    m.t++;
+    if (m.readCd > 0) m.readCd--;
+    if (m.punishCd > 0) m.punishCd--;
+    if (m.counterArm > 0) m.counterArm--;
+    if (m.zoneCd > 0) m.zoneCd--;
+    m.sinceAtk++;
+    if (m.sinceAtk > cfg::kChainReset) m.chain = 0;
+
+    const St st = classify(d);
+    const bool actionChanged = d->action != m.prevAction;
+    const s16 prevAction = m.prevAction;
+    m.prevAction = d->action;
+    const bool lastStand = me.health <= cfg::kLastStandHealth;
+    if (lastStand) g_st.lastStand++;
+
+    // ---- what the last collision pass did to it (flags set at the end of the previous frame) ----
+    bool gotHit = false, blocked = false;
+    for (int i = 0; i < 3; i++) {
+        if (tg_hit(d->cc_sph[i])) gotHit = true;
+    }
+    if (tg_hit(d->tate_sph)) blocked = true;
+    if (gotHit) {
+        g_rage = std::max(g_rage, cfg::kRageAfterHit);
+        if (cfg::kEnableMemory) g_weakUntil[static_cast<int>(g_link.lastType)] = now + cfg::kWeakMemorySec;
+        m.counterArm = cfg::kCounterWindow;  // after it shakes the hit off, it strikes back
+        raise_alarm(m);
+    }
+    if (blocked) {
+        if (cfg::kEnableMemory) g_blocked[static_cast<int>(g_link.lastType)]++;
+        m.counterArm = cfg::kCounterWindow;
+        raise_alarm(m);
+    }
+
+    // ---- bookkeeping when its state just changed ----
+    if (actionChanged) {
+        m.feinting = false;
+        if (st == St::Attack) {
+            m.sinceAtk = 0;
+            m.chain++;
+            m.baseRate = 0.0f;  // re-read the game's rate for this swing
+            g_st.chain += (m.chain > 1) ? 1 : 0;
+            // a feint: hold the wind-up. Chance grows with every repeated pattern of yours.
+            if (cfg::kEnableFeints && !g_link.attacking) {
+                const float p = std::min(cfg::kFeintMax, cfg::kFeintBase + cfg::kFeintPerPattern * pattern_level());
+                if (rand01() < p) {
+                    m.feintHold = cfg::kFeintHold;
+                    m.feinting = true;
+                    g_st.feint++;
+                }
+            }
+        }
+        if (prevAction == lz::DRAWBACK && st == St::Ready && m.afterHop > 0) {
+            // fake retreat: the back-hop ends and it comes straight back with a swing
+            if (cfg::kEnableFeints && dist < cfg::kPunishRange && m.punishCd == 0) {
+                force_attack(d, pick_attack(dist, 0));
+                m.punishCd = 6;
+                m.afterHop = 0;
+                g_st.fakeRetreat++;
+                return;
+            }
+        }
+        if (st != St::Hop && st != St::Ready) m.afterHop = 0;
+    }
+
+    // ---- Link's events ----
+    const Link& L = g_link;
+    const bool newAttack = m.seenAttack != L.attackSeq;
+    const bool newEnd = m.seenEnd != L.attackEndSeq;
+    const bool newRoll = m.seenRoll != L.rollSeq;
+    const bool newBack = m.seenBack != L.backSeq;
+    const bool newItem = m.seenItem != L.itemSeq;
+    const bool newCharge = m.seenCharge != L.chargeSeq;
+    m.seenAttack = L.attackSeq;
+    m.seenEnd = L.attackEndSeq;
+    m.seenRoll = L.rollSeq;
+    m.seenBack = L.backSeq;
+    m.seenItem = L.itemSeq;
+    m.seenCharge = L.chargeSeq;
+
+    const bool canAct = (st == St::Ready) ||
+                      (st == St::Guard) ||
+                      (st == St::Attack && (m.feinting || d->anm_p->getFrame() >= 30.0f));  // an attack in its tail
+
+    // PACK: another Lizalfos read, blocked or got hit: swing at once
+    if (cfg::kEnablePack && m.seenAlarm != g_alarmSeq) {
+        m.seenAlarm = g_alarmSeq;
+        if (st == St::Ready && dist < cfg::kPackRange && m.punishCd == 0) {
+            force_attack(d, pick_attack(dist, rand01() < 0.3f ? 1 : 0));
+            m.punishCd = 8;
+            g_st.pack++;
+            return;
         }
     }
-    return float(n) / float(g_histCount);
-}
 
-void log_event(const char* what, const TN* t, AType type, float dist) {
-    if (g_logBudget <= 0) {
+    // READ: you started an attack. It answers with shield or hop before the blade is out.
+    if (cfg::kEnableReads && newAttack && m.readCd == 0 && canAct && dist < cfg::kReadRange) {
+        m.readCd = cfg::kReadCooldown;
+        const AType t = L.lastType;
+        const int ti = static_cast<int>(t);
+
+        // fight memory: a move that was blocked too often is dropped as bait; it lets one land, then strikes
+        if (cfg::kEnableMemory && g_blocked[ti] >= cfg::kBaitBlocks && rand01() < cfg::kBaitChance) {
+            g_blocked[ti] = 0;
+            m.counterArm = cfg::kCounterWindow;
+            g_st.bait++;
+        } else if (rand01() < cfg::kReadChance) {
+            g_st.read++;
+            const int level = pattern_level();
+            if (move_streak() >= 2) g_st.pattMove++;
+            if (space_streak() >= 2) g_st.pattSpace++;
+            const bool weak = cfg::kEnableMemory && now < g_weakUntil[ti];
+            float hopP = is_air(t) ? cfg::kAirHopChance : cfg::kSlashHopChance;
+            if (weak) hopP = std::min(1.0f, hopP + cfg::kWeakHopBonus);
+            if (is_unblockable(t)) hopP = 1.0f;  // a shield does not stop these
+            // a repeated move gets the exact counter: slashes are shielded (then swept), air moves hopped (then hit)
+            if (level >= 2 && !is_unblockable(t)) hopP = is_air(t) ? 1.0f : 0.0f;
+            m.counterTail = (t == AType::Slash || t == AType::Bash) ? 1 : 0;
+            if (rand01() < hopP) {
+                force_hop(d);
+                m.afterHop = 20;
+                g_st.hop++;
+                if (weak) g_st.weakHop++;
+            } else {
+                force_guard(d, is_air(t));
+                g_st.guard++;
+            }
+            m.counterArm = cfg::kCounterWindow;
+            raise_alarm(m);
+            return;
+        } else {
+            g_st.readMiss++;
+        }
+    }
+
+    // while you keep attacking it keeps the guard up: no streak count ever drops it
+    if (st == St::Guard && d->mode == 7 && (L.attacking || (now - L.lastAttackAt) < 0.35)) {
+        d->timer[0] = 5;
+    }
+
+    // PUNISH: everything you do that is not safe
+    if (cfg::kEnablePunish && m.punishCd == 0 && dist < cfg::kPunishRange) {
+        const bool settled = st == St::Ready || (st == St::Guard && (d->mode >= 7)) ||
+                             (st == St::Attack && m.feinting);
+        // after your swing ends (you missed or were blocked), after a block, after a shake-off: 100%
+        if (newEnd && settled) m.counterArm = std::max(m.counterArm, cfg::kCounterWindow);
+        if (m.counterArm > 0 && !L.attacking && settled) {
+            force_attack(d, pick_attack(dist, m.counterTail));
+            m.counterArm = 0;
+            m.punishCd = 6;
+            g_st.counter++;
+            return;
+        }
+        if (newRoll && settled) {
+            if (dodge_streak() >= 2) g_st.pattDodge++;
+            force_attack(d, pick_attack(dist, 0));
+            m.punishCd = 6;
+            g_st.rollPunish++;
+            return;
+        }
+        if (newBack && settled) {  // backflip: it follows with a strike
+            force_attack(d, lz::ATTACK);
+            m.punishCd = 6;
+            g_st.backPunish++;
+            return;
+        }
+        if (newCharge && settled) {  // spin charge: it interrupts the charge
+            force_attack(d, lz::ATTACK_0);
+            m.punishCd = 6;
+            g_st.chargePunish++;
+            return;
+        }
+        if (newItem && settled) {  // bow / boomerang / hookshot: close in (and swing) or shield the arrow
+            if (dist < 360.0f) {
+                force_attack(d, pick_attack(dist, 0));
+            } else {
+                force_guard(d, false);
+            }
+            m.punishCd = 6;
+            g_st.itemPunish++;
+            return;
+        }
+        if (st == St::Ready && L.stillFrames >= cfg::kStillFrames && !L.attacking) {
+            force_attack(d, pick_attack(dist, 0));
+            m.punishCd = 10;
+            g_st.stillPunish++;
+            return;
+        }
+        // shield-up turtling or hiding: the tail sweep goes around a shield
+        if (st == St::Ready && dist < cfg::kTurtleRange && !L.attacking &&
+            (now - L.lastAttackAt) > cfg::kTurtleSec) {
+            force_attack(d, lz::TAIL_ATTACK);
+            m.punishCd = 12;
+            g_st.turtle++;
+            return;
+        }
+    }
+
+    // ---- shake off small hits so a combo can never loop on it ----
+    if (cfg::kEnableCut && st == St::Shake) {
+        m.shakeT++;
+        if (m.shakeT >= cfg::kShakeTicks) {
+            m.shakeT = 0;
+            force_run(d);
+            m.counterArm = cfg::kCounterWindow;
+            g_st.shake++;
+            return;
+        }
+    } else {
+        m.shakeT = 0;
+    }
+
+    // ---- its own swing ----
+    if (st == St::Attack) {
+        const float frame = d->anm_p->getFrame();
+        // feint: hold the wind-up at the minimum play speed; if you swing into the hold it drops into guard
+        if (m.feinting && m.feintHold > 0 && frame < cfg::kFeintFrame + 6.0f) {
+            if (newAttack || L.attacking) {
+                m.feinting = false;
+                m.feintHold = 0;
+                d->anm_p->setPlaySpeed(m.baseRate > 0.0f ? m.baseRate : 1.0f);
+                force_guard(d, false);
+                g_st.feintCancel++;
+                g_st.guard++;
+                return;
+            }
+            if (frame >= cfg::kFeintFrame) {
+                if (m.baseRate == 0.0f && d->mode >= 1) m.baseRate = std::max(d->anm_p->getPlaySpeed(), cfg::kMinPlaySpeed);
+                d->anm_p->setPlaySpeed(cfg::kMinPlaySpeed);
+                m.feintHold--;
+            }
+        } else if (m.feinting) {
+            m.feinting = false;  // hold over: restore the game's rate (re-scaled below)
+            if (m.baseRate > 0.0f) d->anm_p->setPlaySpeed(m.baseRate);
+        }
+        // swing speed: the game's own rate for this swing, scaled by an absolute factor (never compounding)
+        if (cfg::kEnableSpeed && !m.feinting && d->mode >= 1) {
+            if (m.baseRate == 0.0f) m.baseRate = std::max(d->anm_p->getPlaySpeed(), cfg::kMinPlaySpeed);
+            const float want = std::min(m.baseRate * swing_mult(lastStand), cfg::kSwingRateCap);
+            d->anm_p->setPlaySpeed(std::max(want, cfg::kMinPlaySpeed));
+            g_st.sped++;
+        }
+        // cut the harmless tail so it can chain the next swing
+        const float cutFrame = d->action == lz::ATTACK_0 ? cfg::kCutFrameAttack0
+                               : d->action == lz::ATTACK  ? cfg::kCutFrameAttack
+                                                          : cfg::kCutFrameTail;
+        if (cfg::kEnableCut && !m.feinting && frame >= cutFrame) {
+            force_run(d);
+            g_st.cut++;
+            // chain: straight into the next swing while you are in range
+            const int maxChain = lastStand ? 99 : cfg::kChainMax + ((now < g_burstUntil) ? cfg::kBurstChainBonus : 0);
+            if (cfg::kEnableChains && m.chain < maxChain && dist < cfg::kChainRange) {
+                static const s16 order[3] = {lz::ATTACK_0, lz::ATTACK, lz::TAIL_ATTACK};
+                force_attack(d, order[(m.chain + pattern_level()) % 3]);
+                g_st.chain++;
+            }
+            return;
+        }
+    }
+
+    // ---- tempo: its attack timer is cut to almost nothing (burst and heat make it nothing at all) ----
+    if (st == St::Ready) {
+        int gap = cfg::kAttackGap;
+        if (now < g_burstUntil || lastStand || heat_now() > 0.9f) gap = 0;
+        if (d->timer[2] > gap) d->timer[2] = static_cast<s16>(gap);
+    }
+
+    // ---- zoning: it keeps just out of your reach while you are idle, and enters when you commit ----
+    if (cfg::kEnableZoning && st == St::Ready && m.zoneCd == 0 && !L.attacking && dist > 1.0f && dist < cfg::kZoneMin &&
+        rand01() < cfg::kZoneChance) {
+        force_hop(d);
+        m.zoneCd = 40;
+        m.afterHop = 0;
+        g_st.zone++;
         return;
     }
-    g_logBudget--;
-    mods::log::info("darknut: {} ({}) - your {} at {:.0f} units", what, h_mode(t) ? "armored" : "armor off",
-                    atype_name(type), dist);
-}
 
-// Face you, shield up from every angle (the game's own "mTimer10": guard from anywhere).
-void raise_guard(TN* t, const fopAc_ac_c* plr, int ticks) {
-    turn_toward(t, angle_to(t, plr), 0x7FFF);
-    t->field_0xa91 = true;
-    if (t->mTimer10 < ticks) {
-        t->mTimer10 = static_cast<u8>(std::min(ticks, 200));
-    }
-}
-
-// NEVER force the armor-off sword-guard state (ACT_GUARDL) from here. Its first tick calls the game's
-// getCutType(), which dereferences mAtInfo.mpCollider with no null check. The game only enters that state from
-// inside damage_check, right after it has pointed mpCollider at the thing that hit it; damage_check also resets
-// mpCollider to NULL at the start of every frame, so a state forced from the mod always meets NULL = crash.
-// Armor off therefore just raises the game's own guard flags: the first hit that lands is then blocked by the
-// game's normal path (real sparks, real guard animation, valid collider). Armored is safe (GUARDH never reads it).
-void enter_guard_state(TN* t, const fopAc_ac_c* plr, St st) {
-    raise_guard(t, plr, (h_mode(t) ? cfg::kArmTicks : cfg::kArmTicksL) + 8);
-    t->field_0xaa8 = false;
-    if (h_mode(t)) {
-        enter(t, TN::ACT_GUARDH, TN::ACTION2_0_e);
-    } else if (st == St::Attack) {
-        // mid-recovery of its own swing: drop the swing and go back to the guarded chase (turns the sword hitbox off)
-        enter(t, TN::ACT_CHASEL, TN::ACTION2_0_e);
-    }
-}
-
-// Blind-side jump: away from the side you usually dodge toward (code 10 = its negative side, 13 = positive side).
-int pick_side(const Mem& m) {
-    if (m.bias >= 2) {
-        return 10;
-    }
-    if (m.bias <= -2) {
-        return 13;
-    }
-    return rand01() < 0.5f ? 10 : 13;
-}
-
-// which: 6 = back-jump, 10 = jump right, 13 = jump left (the game's own dodge jumps)
-bool do_dodge(TN* t, int which, Mem& m) {
-    if (!g_jumpHook || TnInitChaseL::g_orig == nullptr || h_mode(t)) {
-        return false;
-    }
-    enter(t, TN::ACT_CHASEL, TN::ACTION2_0_e);
-    TnInitChaseL::g_orig(t, which);
-    if (which != 6) {
-        t->mTimer7 = 10;
-    }
-    m.sinceDodge = 0;
-    return true;
-}
-
-void start_attack(TN* t, Mem& m, float dist) {
-    if (h_mode(t)) {
-        // like the game: the shield kick at point-blank, unless its armor is nearly gone
-        enter(t, (dist < 200.0f && t->mNextBreakPart < 11) ? TN::ACT_ATTACKSHIELDH : TN::ACT_ATTACKH,
-              TN::ACTION2_0_e);
-    } else {
-        enter(t, dist < 200.0f ? TN::ACT_ATTACKSHIELDL : TN::ACT_ATTACKL, TN::ACTION2_0_e);
-    }
-    m.atkCd = static_cast<int>((h_mode(t) ? cfg::kAttackGapH : cfg::kAttackGapL) * (1.0f - 0.5f * g_heat) *
-                               (1.0f - cfg::kRageGap * rage_of(t, m)));
-    m.chainRolled = false;
-    m.speeded = false;
-    m.armed = 0;
-    if (std::abs(m.bias) >= 2) {
-        // you keep dodging to one side: it aims its swing a little that way
-        t->shape_angle.y = static_cast<s16>(t->shape_angle.y + (m.bias > 0 ? cfg::kBiasTurn : -cfg::kBiasTurn));
-    }
-}
-
-float read_chance(AType t, bool recovering, bool lmode) {
-    const float habit = clampf((habit_share(t) - 0.25f) / 0.5f, 0.0f, 1.0f);
-    float c = lmode ? std::min(cfg::kReadMaxL, cfg::kReadBaseL + cfg::kReadHabitBonus * habit)
-                    : std::min(cfg::kReadMax, cfg::kReadBase + cfg::kReadHabitBonus * habit);
-    if (recovering) {
-        c *= cfg::kRecoveryReadMult;
-    }
-    return c;
-}
-
-// Returns true if the Darknut reacted (read the move).
-bool try_read(TN* t, Mem& m, const fopAc_ac_c* plr, AType type, St st, float dist, float fx, float fz) {
-    if (m.expose > 0 || m.readCd > 0) {
-        return false;
-    }
-    // A swing it is holding back in its wind-up is a feint: if you swing into it, it drops the swing and guards.
-    const bool recovering = (st == St::Attack) && (in_recovery(t) || m.hold > 0);
-    // You attack again right after it dodged, while it is still landing: it dodges AGAIN, so chasing it with combos fails.
-    const int m2now = t->mActionMode2;
-    const bool doubleDodge = !h_mode(t) && g_jumpHook && TnInitChaseL::g_orig != nullptr &&
-                             m.sinceDodge < cfg::kDoubleDodgeTicks && st == St::Other &&
-                             t->mActionMode1 == TN::ACT_CHASEL &&
-                             (m2now == 7 || m2now == 9 || m2now == 12 || m2now == 15);
-    if (!(st == St::Ready || st == St::Guard || recovering || doubleDodge)) {
-        return false;
-    }
-    const bool wide = wide_move(type);
-    if (dist > (wide ? cfg::kReadRangeWide : cfg::kReadRange) || dist < 1.0f) {
-        return false;
-    }
-    if (!wide) {
-        const float ex = (t->current.pos.x - plr->current.pos.x) / dist;  // you -> it
-        const float ez = (t->current.pos.z - plr->current.pos.z) / dist;
-        if (ex * fx + ez * fz < cfg::kReadLinkFacingCos) {
-            return false;
-        }
-    }
-    // No dodge from inside the game's own guard animation: that state is left to the game.
-    const bool canDodge = g_jumpHook && TnInitChaseL::g_orig != nullptr && !h_mode(t) && st != St::Guard;
-    if (type == AType::Bash && !canDodge) {
-        return false;  // a bash is meant to break its guard: only a dodge makes sense
-    }
-    // A jump strike is never even rolled for: it just sidesteps it (then punishes the landing).
-    const bool jumpCounter = canDodge && (type == AType::Jump || type == AType::Large);
-    if (!jumpCounter && !doubleDodge && rand01() >= read_chance(type, recovering, !h_mode(t))) {
-        return false;
-    }
-
-    const bool repeating =
-        g_histCount >= cfg::kHabitMinSamples && habit_share(type) >= cfg::kHabitShare;
-    if (repeating) {
-        m.hot = cfg::kHotTicks;
-        g_stats.habit++;
-    }
-    g_readThisTick = true;
-    m.readCd = h_mode(t) ? cfg::kReadCooldown : cfg::kReadCooldownL;
-    m.streakAge = 0;
-    m.riposteTry = 0;
-    m.riposteIn = -1;
-    g_stats.read++;
-    m.streak++;
-    m.armed = h_mode(t) ? cfg::kArmTicks : cfg::kArmTicksL;
-    const float rage = rage_of(t, m);
-    if (m.streak >= (h_mode(t) ? cfg::kStreakMax : cfg::kStreakMaxL + int(cfg::kRageStreak * rage))) {
-        m.streak = 0;
-        m.expose = h_mode(t) ? cfg::kExposeTicks
-                             : std::max(4, int(cfg::kExposeTicksL * (1.0f - cfg::kRageExpose * rage)));
-        g_stats.opening++;
-    }
-
-    // Choose a dodge for the armor-off Darknut (the armored one has no dodge jumps and always guards).
-    if (canDodge) {
-        float back = 0.0f, side = 0.0f;
-        switch (type) {
-        case AType::Slash: back = cfg::kEvadeBackSlash; side = cfg::kEvadeSideSlash; break;
-        case AType::Jump: back = cfg::kEvadeBackJump; side = cfg::kEvadeSideJump; break;
-        case AType::Spin:
-        case AType::Large:
-        case AType::Down: back = cfg::kEvadeBackWide; break;
-        case AType::Head: side = cfg::kEvadeSideHead; break;
-        case AType::Bash: back = cfg::kEvadeBackBash; break;
-        default: break;
-        }
-        if (repeating) {
-            if (type == AType::Head) {
-                back = 0.0f;
-                side = 0.85f;
-            } else if (type == AType::Slash) {
-                back = 0.45f;
-                side = 0.40f;
+    // ---- movement (absolute speeds): the run and the strafe hops, only while it faces you ----
+    if (cfg::kEnableSpeed && st == St::Ready && d->mode >= 0 && d->mode <= 2) {
+        const s16 faceErr = static_cast<s16>(angle_to(me, plr) - me.current.angle.y);
+        if (std::abs(static_cast<int>(faceErr)) < cfg::kFaceTolerance) {
+            // stop-and-surge: it stops dead for a moment, then surges
+            if (cfg::kEnableFeints && m.stopTicks == 0 && m.surgeTicks == 0 && d->mode <= 1 &&
+                rand01() < cfg::kStopSurgeChance) {
+                m.stopTicks = cfg::kStopTicks;
+            }
+            if (m.stopTicks > 0) {
+                m.stopTicks--;
+                me.speedF = 0.0f;
+                if (m.stopTicks == 0) m.surgeTicks = cfg::kSurgeTicks;
             } else {
-                back = 0.85f;
-                side = 0.0f;
-            }
-        }
-        {
-            // a move of this type got through its defence recently: it dodges that one more
-            const int idx = std::clamp(static_cast<int>(type), 0, 7);
-            const float lb = std::min(cfg::kLandedBiasMax, cfg::kLandedBias * float(g_landedBy[idx]));
-            if (back > 0.0f) {
-                back = std::min(0.95f, back + lb);
-            } else {
-                side = std::min(0.95f, side + lb);
-            }
-        }
-        if (jumpCounter) {
-            back = 0.2f;
-            side = 0.8f;
-        }
-        if (doubleDodge) {
-            back = 0.35f;
-            side = 0.65f;
-        }
-        const float r = rand01();
-        if (r < back) {
-            if (do_dodge(t, 6, m)) {
-                g_stats.evade++;
-                g_stats.jumpdodge += jumpCounter ? 1 : 0;
-                g_stats.doubled += doubleDodge ? 1 : 0;
-                log_event("read -> back-jump", t, type, dist);
-                return true;
-            }
-        } else if (r < back + side) {
-            if (do_dodge(t, pick_side(m), m)) {
-                g_stats.evade++;
-                g_stats.jumpdodge += jumpCounter ? 1 : 0;
-                g_stats.doubled += doubleDodge ? 1 : 0;
-                log_event("read -> side-jump", t, type, dist);
-                return true;
+                float v = 0.0f;
+                if (d->mode <= 1) {
+                    v = cfg::kRunBase * cfg::kMoveMult;
+                } else if (me.speedF > 0.5f) {
+                    v = cfg::kStrafeBase * cfg::kMoveMult;
+                }
+                if (m.surgeTicks > 0) {
+                    m.surgeTicks--;
+                    v = cfg::kSpeedCap;
+                    g_st.surge++;
+                }
+                if (v > 0.0f) {
+                    v = std::min(v, cfg::kSpeedCap);
+                    v = std::min(v, std::max(0.0f, dist - cfg::kBrakeMargin));
+                    if (v > me.speedF) {
+                        me.speedF = v;
+                    }
+                }
             }
         }
     }
-    if (doubleDodge) {
-        return false;  // no dodge this time: it never guards from the middle of a landing
-    }
-    if (type == AType::Bash) {
-        m.armed = 0;
-        return false;
-    }
-    enter_guard_state(t, plr, st);
-    g_stats.guard++;
-    log_event("read -> guard", t, type, dist);
-    return true;
 }
 
-int collect_tn(void* actor, void* data) {
-    auto* list = static_cast<std::vector<fopAc_ac_c*>*>(data);
-    auto* a = static_cast<fopAc_ac_c*>(actor);
-    if (fopAcM_GetProfName(a) == fpcNm_B_TN_e) {
-        list->push_back(a);
+// POST hook: runs right after its update, before collision resolves. The sword sphere's power was just written
+// by the game (1 or 2); scale it here. The game rewrites it every frame, so this never compounds.
+static void after(e_dn_class* d) {
+    if (!cfg::kEnableDamage) return;
+    auto it = g_mem.find(d);
+    if (it == g_mem.end()) return;
+    Mem& m = it->second;
+    const int cur = d->at_sph.GetAtAtp();
+    if (cur != m.scaledAtp || m.scaledAtp == 0) {
+        m.baseAtp = cur;  // the game wrote a fresh value this frame
     }
-    return 1;
+    if (m.baseAtp <= 0) return;
+    const int want = std::min(cfg::kAtpMax, std::max(1, static_cast<int>(std::lround(m.baseAtp * damage_mult()))));
+    d->at_sph.SetAtAtp(want);
+    m.scaledAtp = want;
+    g_st.scaled++;
 }
 
-void reset_link_state() {
-    g_prevProc = 0;
-    g_prevSwinging = false;
-    g_prevLinkAtk = false;
-    g_sinceAtkStart = 1000;
-    g_sinceAtkEnd = 1000;
-    g_combo = 0;
-    g_lastAtype = AType::None;
-    g_linkHurt = 0;
-    g_prevLife = -1;
-}
-
-constexpr u32 kHitMask = u32(AT_TYPE_NORMAL_SWORD) | u32(AT_TYPE_MASTER_SWORD) | u32(AT_TYPE_SHIELD_ATTACK) |
-                         u32(AT_TYPE_WOLF_CUT_TURN) | u32(AT_TYPE_WOLF_ATTACK);
-
-// Hits the Darknut's guard cannot take by itself are cancelled while it has read your move: the 4th hit of a
-// combo (armor off: that is how the game staggers it) and any hit once its armor is nearly gone.
-HookAction on_at_tg_hit(ModContext*, void* args, void*, void*) {
-    cCcD_Obj* at = mods::arg<cCcD_Obj*>(args, 1);
-    cCcD_Obj* tg = mods::arg<cCcD_Obj*>(args, 2);
-    if (at == nullptr || tg == nullptr || (u32(at->GetAtType()) & kHitMask) == 0) {
-        return HOOK_CONTINUE;
-    }
-    cCcD_Stts* as = at->GetStts();
-    cCcD_Stts* ts = tg->GetStts();
-    fopAc_ac_c* plr = dComIfGp_getPlayer(0);
-    if (as == nullptr || ts == nullptr || plr == nullptr) {
-        return HOOK_CONTINUE;
-    }
-    fopAc_ac_c* dst = ts->GetAc();
-    if (as->GetAc() != plr || dst == nullptr || dst == plr || fopAcM_GetProfName(dst) != fpcNm_B_TN_e) {
-        return HOOK_CONTINUE;
-    }
-    auto it = g_mem.find(dst);
-    if (it == g_mem.end() || it->second.armed <= 0) {
-        return HOOK_CONTINUE;
-    }
-    auto* t = static_cast<TN*>(dst);
-    const bool cancel = h_mode(t) ? (t->mNextBreakPart >= 11) : (g_combo >= cfg::kComboCancel);
-    if (cancel) {
-        g_stats.negated++;
-        return HOOK_SKIP_ORIGINAL;
+static HookAction on_pre(ModContext*, void* args, void*, void*) {
+    if (g_off) return HOOK_CONTINUE;
+    e_dn_class* d = mods::arg<e_dn_class*>(args, 0);
+    if (d == nullptr) return HOOK_CONTINUE;
+    brain(d);
+    if (g_bad >= cfg::kLayoutBadLimit && g_bad * 3 > g_good) {
+        g_off = true;
+        mods::log::error(
+            "lizalfos_nightmare: LAYOUT MISMATCH (bad={} good={}): the game does not match the headers this was "
+            "built against. The mod is switched OFF.",
+            g_bad, g_good);
     }
     return HOOK_CONTINUE;
 }
 
-void tick() {
-    fopAc_ac_c* plr = dComIfGp_getPlayer(0);
-    if (plr == nullptr || dComIfGp_event_runCheck()) {
-        reset_link_state();
-        g_mem.clear();
-        return;
-    }
-    auto* py = static_cast<daPy_py_c*>(plr);
-    auto* link = static_cast<daAlink_c*>(plr);
-    g_tick++;
-
-    // ---- What is Link doing? ----
-    const bool swinging = py->getCutAtFlg();
-    const bool jumpStrike = py->checkCutJumpMode();
-    const u16 proc = link->mProcID;
-    const AType atype = attack_type_of(proc);
-    const bool linkAtk = swinging || jumpStrike || atype != AType::None;
-    g_sinceAtkStart++;
-    g_sinceAtkEnd++;
-    const bool procStart = atype != AType::None && proc != g_prevProc;
-    const bool flagStart = swinging && !g_prevSwinging && g_sinceAtkStart > 8;
-    const bool attackStart = procStart || flagStart;
-    const AType startType = (atype != AType::None) ? atype : AType::Slash;
-    if (attackStart) {
-        if (startType == AType::Slash) {
-            g_combo = (g_sinceAtkStart <= cfg::kComboGap) ? g_combo + 1 : 1;
-        } else {
-            g_combo = 0;
-        }
-        g_sinceAtkStart = 0;
-        g_lastAtype = startType;
-        remember_attack(startType);
-    } else if (g_sinceAtkStart > cfg::kComboGap + 20 && !swinging) {
-        g_combo = 0;
-    }
-    const bool rollStart = (proc == daAlink_c::PROC_FRONT_ROLL || proc == daAlink_c::PROC_SIDE_ROLL ||
-                            proc == daAlink_c::PROC_BACK_JUMP) && proc != g_prevProc;
-    const bool charging = py->checkCutCharge();
-    const bool ranged = proc == daAlink_c::PROC_BOW_MOVE || proc == daAlink_c::PROC_BOW_SUBJECT ||
-                        proc == daAlink_c::PROC_BOOMERANG_MOVE || proc == daAlink_c::PROC_BOOMERANG_SUBJECT ||
-                        proc == daAlink_c::PROC_HOOKSHOT_MOVE || proc == daAlink_c::PROC_HOOKSHOT_SUBJECT;
-    {
-        // pressure: long without being hit, or you are low on hearts
-        const auto& sa = g_dComIfG_gameInfo.info.getPlayer().getPlayerStatusA();
-        const float maxLife = std::max<float>(1.0f, sa.getMaxLife());
-        const float lifeRatio = clampf(sa.getLife() / maxLife, 0.0f, 1.0f);
-        g_sinceLanded++;
-        const int life = static_cast<int>(sa.getLife());
-        if (g_prevLife >= 0 && life < g_prevLife) {
-            g_linkHurt = cfg::kFinishTicks;  // you just took a hit: it goes for the kill
-        } else if (g_linkHurt > 0) {
-            g_linkHurt--;
-        }
-        g_prevLife = life;
-        if (++g_landedAge > cfg::kLandedAge) {
-            g_landedAge = 0;
-            for (int& n : g_landedBy) {
-                n = std::max(0, n - 1);
-            }
-        }
-        g_heat = clampf(std::min(1.0f, g_sinceLanded / (cfg::kHeatSeconds * 30.0f)) * 0.6f +
-                            std::max(0.0f, 0.5f - lifeRatio) * 1.2f,
-                        0.0f, 1.0f);
-    }
-    g_readThisTick = false;
-    const bool finish = g_linkHurt > 0;
-    const bool attackEnd = !linkAtk && g_prevLinkAtk;
-    if (attackEnd) {
-        g_sinceAtkEnd = 0;
-    }
-    g_prevLinkAtk = linkAtk;
-    g_prevProc = proc;
-    g_prevSwinging = swinging;
-
-    const float facing = plr->shape_angle.y * kAngleToRad;
-    const float fx = std::sin(facing);  // your forward direction on the ground
-    const float fz = std::cos(facing);
-
-    std::vector<fopAc_ac_c*> all;
-    fopAcIt_Executor(collect_tn, &all);
-
-    std::unordered_map<const void*, Mem> alive;
-    std::vector<std::pair<TN*, float>> strikers;
-    int engaged = 0;
-    for (fopAc_ac_c* a : all) {
-        const float dist = dist_xz(a, plr);
-        if (dist > cfg::kEngageRange) {
-            continue;
-        }
-        auto* en = static_cast<fopEn_enemy_c*>(a);
-        if (en->checkDeadFlg() || en->checkDownFlg()) {
-            continue;
-        }
-        auto* t = static_cast<TN*>(a);
-        if (t->mInactive || t->mDisappear) {
-            continue;
-        }
-        engaged++;
-
-        auto it = g_mem.find(a);
-        Mem m = (it != g_mem.end()) ? it->second : Mem{};
-        if (!m.seen) {
-            m.seen = true;
-            mods::log::info("darknut: found one (type {}, state {}/{}, {:.0f} units away)", int(t->mType),
-                            t->mActionMode1, t->mActionMode2, dist);
-        }
-
-        // timers
-        if (m.armed > 0) {
-            m.armed--;
-        } else if (m.expose > 0) {
-            m.expose--;
-        }
-        if (m.readCd > 0) m.readCd--;
-        if (m.hot > 0) m.hot--;
-        if (m.atkCd > 0) m.atkCd--;
-        if (m.leapCd > 0) m.leapCd--;
-        if (m.zoneCd > 0) m.zoneCd--;
-        if (m.sinceDodge < 1000) m.sinceDodge++;
-        if (m.streak > 0 && ++m.streakAge > cfg::kStreakForget) {
-            m.streak = 0;
-            m.streakAge = 0;
-        }
-
-        bool shookOff = false;
-        bool guardOff = false;
-        bool yorokeOff = false;
-        // Armor-off: the stagger from your jump strike / 4th hit (the game's long "knocked back" animation) is cut
-        // short. Your hit still connects; it just does not give you a free window afterwards.
-        if (t->mActionMode1 == TN::ACT_YOROKE && t->mActionMode2 == TN::ACTION2_10_e && t->mpModelMorf2 != nullptr &&
-            t->mpModelMorf2->getFrame() >= cfg::kYorokeCancelFrame) {
-            enter(t, TN::ACT_CHASEL, TN::ACTION2_0_e);  // the same transition the game makes when that animation ends
-            t->field_0xa91 = true;
-            yorokeOff = true;
-        }
-        // Armor-off: it shakes off a hit early instead of staying staggered for your combo.
-        if (t->mActionMode1 == TN::ACT_DAMAGEL && t->mActionMode2 >= 2 && t->mpModelMorf2 != nullptr &&
-            t->mpModelMorf2->getFrame() >= cfg::kStunCancelFrameL -
-                                               (cfg::kStunCancelFrameL - cfg::kStunCancelMinL) * rage_of(t, m)) {
-            enter(t, TN::ACT_CHASEL, TN::ACTION2_0_e);
-            t->field_0xa91 = true;
-            shookOff = true;
-        }
-        // Armor-off: once your swing has been absorbed it leaves its guard animation early, ready to counter.
-        if (t->mActionMode1 == TN::ACT_GUARDL && t->mActionMode2 == TN::ACTION2_1_e && !linkAtk &&
-            t->mpModelMorf2 != nullptr && t->mpModelMorf2->getFrame() >= cfg::kGuardCancelFrameL) {
-            enter(t, TN::ACT_CHASEL, TN::ACTION2_0_e);
-            t->field_0xa91 = true;
-            guardOff = true;
-        }
-
-        const St st = classify(t);
-        const bool lmode = !h_mode(t);
-        const s16 toLink = angle_to(t, plr);
-        bool changed = false;
-
-        if (lmode && !m.rageInit) {
-            m.rageInit = true;
-            m.hits = std::max(m.hits, cfg::kRageStartHits);
-        }
-        // Recovered from the stagger: it jumps aside (agile) or swings straight back.
-        if (yorokeOff && lmode && rand01() < cfg::kYorokeDodge &&
-            do_dodge(t, pick_side(m), m)) {
-            g_stats.evade++;
-            changed = true;
-        }
-        // It took your hit / blocked your swing and is out of that state: it swings back at once.
-        if (!changed && (shookOff || guardOff || yorokeOff) && lmode && dist < cfg::kRiposteRange && angle_gap(t, toLink) < 0x5000 &&
-            rand01() < (shookOff ? cfg::kShakeCounter : cfg::kGuardCounter) + 0.3f * rage_of(t, m)) {
-            start_attack(t, m, dist);
-            g_stats.counter++;
-            changed = true;
-        }
-        // It just landed from a dodge-jump or a leap (animation over): it swings at once instead of resetting.
-        if (!changed && lmode && st == St::Ready && t->mpModelMorf2 != nullptr && t->mpModelMorf2->isStop()) {
-            const int m2 = t->mActionMode2;
-            if ((m2 == TN::ACTION2_7_e || m2 == TN::ACTION2_8_e || m2 == TN::ACTION2_12_e || m2 == TN::ACTION2_15_e ||
-                 m2 == TN::ACTION2_17_e) &&
-                dist < cfg::kRiposteRange && angle_gap(t, toLink) < 0x5000 && rand01() < cfg::kPostMoveStrike) {
-                start_attack(t, m, dist);
-                g_stats.landing++;
-                changed = true;
-            }
-        }
-
-        // It got hit: it starts over.
-        const bool hurt = (st == St::Hurt);
-        if (hurt && !m.lastHurt) {
-            g_stats.landed++;
-            g_sinceLanded = 0;
-            if (lmode) {
-                m.hits++;
-            }
-            g_landedBy[std::clamp(static_cast<int>(g_lastAtype), 0, 7)] =
-                std::min(3, g_landedBy[std::clamp(static_cast<int>(g_lastAtype), 0, 7)] + 1);
-            m.streak = 0;
-            m.armed = 0;
-            m.expose = 0;
-        }
-        m.lastHurt = hurt;
-
-        if (st == St::Attack) {
-            m.chainAge = 0;
-        } else {
-            if (m.hold > 0 && t->mpModelMorf2 != nullptr && t->mpModelMorf2->getPlaySpeed() < 0.1f) {
-                t->mpModelMorf2->setPlaySpeed(1.0f);  // the swing was interrupted mid-hold: never leave it frozen
-            }
-            m.holdDone = false;
-            m.hold = 0;
-            m.speeded = false;     // the game started its next swing by itself: boost that one too
-            m.chainRolled = false;
-            if (++m.chainAge > 40) {
-                m.chain = 0;
-            }
-        }
-
-        if (lmode) {
-            g_rageSeen = std::max(g_rageSeen, rage_of(t, m));
-        }
-
-        if (rollStart) {
-            const s16 rel = static_cast<s16>(plr->current.angle.y - toLink);
-            const float side = std::sin(rel * kAngleToRad);
-            if (std::abs(side) > 0.4f) {
-                m.bias = std::clamp(m.bias + (side > 0.0f ? 1 : -1), -cfg::kBiasMax, cfg::kBiasMax);
-                m.biasAge = 0;
-            }
-        }
-        if (m.bias != 0 && ++m.biasAge > cfg::kBiasAge) {
-            m.bias += (m.bias > 0 ? -1 : 1);
-            m.biasAge = 0;
-        }
-
-        // ---- 1. read the move you just started ----
-        if (attackStart) {
-            if (try_read(t, m, plr, startType, st, dist, fx, fz)) {
-                changed = true;
-            }
-        }
-
-        if (attackStart && !changed && st == St::Ready && dist < cfg::kRiposteRange) {
-            strikers.emplace_back(t, dist);  // did not read it: a pack mate may swing while you are committed
-        }
-
-        // ---- 2. keep the read going: face you, guard from every angle; or open up after the streak ----
-        if (!changed && (st == St::Ready || st == St::Guard)) {
-            if (m.armed > 0) {
-                raise_guard(t, plr, 6);
-            } else if (m.expose > 0) {
-                t->field_0xa91 = false;
-                t->mTimer10 = 0;
-            }
-        }
-
-        // ---- 3. riposte: your swing just ended ----
-        const bool landing = (g_lastAtype == AType::Jump || g_lastAtype == AType::Head || g_lastAtype == AType::Large);
-        const bool sure = m.hot > 0 || landing;  // a jump strike / helm splitter leaves you open: it never misses that
-        if (attackEnd && dist < cfg::kRiposteRange + (landing ? cfg::kLandingRange : 0) &&
-            rand01() < (sure ? 1.0f : cfg::kRiposteChance)) {
-            m.riposteIn = sure ? 1 : cfg::kRiposteDelay;
-            m.riposteTry = 0;
-        }
-        if (m.riposteIn > 0 && --m.riposteIn == 0) {
-            m.riposteTry = cfg::kRiposteWindow;
-            m.riposteIn = -1;
-        }
-        if (m.riposteTry > 0) {
-            m.riposteTry--;
-            if (m.armed > 0 || linkAtk) {
-                m.riposteTry = 0;  // you are swinging again: it reads instead
-            } else if (!changed && st == St::Ready && dist < cfg::kRiposteRange + (landing ? cfg::kLandingRange : 0) &&
-                       angle_gap(t, toLink) < 0x4000) {
-                start_attack(t, m, dist);
-                g_stats.riposte++;
-                m.riposteTry = 0;
-                changed = true;
-            }
-        }
-
-        // ---- 3a. you rolled / backflipped out of reach, or charge a spin from afar: it leaps in and swings on landing ----
-        if (!changed && st == St::Ready && lmode && g_jumpHook && TnInitChaseL::g_orig != nullptr && m.leapCd == 0 &&
-            dist > cfg::kRiposteRange * 0.8f && dist < 800.0f && angle_gap(t, toLink) < 0x4000 &&
-            ((rollStart && rand01() < cfg::kRollRush) || (charging && rand01() < cfg::kChargeRush))) {
-            enter(t, TN::ACT_CHASEL, TN::ACTION2_0_e);
-            TnInitChaseL::g_orig(t, dist < 700.0f ? 8 : 17);  // the game's own forward leap
-            m.leapCd = cfg::kLeapCooldown / 2;
-            g_stats.rush++;
-            changed = true;
-        }
-
-        // ---- 3b. punish a roll / backflip, and interrupt a spin charge (both phases) ----
-        if (!changed && st == St::Ready && dist < cfg::kRiposteRange && angle_gap(t, toLink) < 0x4000) {
-            if ((rollStart && rand01() < cfg::kPunishChance) ||
-                (charging && dist < 350.0f && rand01() < (lmode ? cfg::kChargePunishL : cfg::kChargePunish))) {
-                start_attack(t, m, dist);
-                g_stats.punish++;
-                changed = true;
-            }
-        }
-
-        // ---- 4. chain: swing again without waiting out its recovery ----
-        if (!changed && st == St::Attack && m.armed == 0 && in_recovery(t) && !m.chainRolled) {
-            m.chainRolled = true;
-            const bool full = lmode && rage_of(t, m) >= 0.99f;  // full rage: a flurry
-            const int chainMax = (lmode ? cfg::kChainMaxL + int(cfg::kRageChain * rage_of(t, m)) : cfg::kChainMax) +
-                                 (finish ? cfg::kFinishChain : 0) + (full ? cfg::kFlurryChain : 0);
-            if (m.chain < chainMax && dist < cfg::kChainRange && angle_gap(t, toLink) < 0x3800 &&
-                (finish || rand01() < cfg::kChainChance)) {
-                m.chain++;
-                start_attack(t, m, dist);
-                g_stats.chain++;
-                changed = true;
-            } else if (lmode && !finish && rand01() < (full ? 1.0f : cfg::kHitRunChance) &&
-                       do_dodge(t, pick_side(m), m)) {
-                // chain over: instead of standing in your counter it jumps aside, then strikes again on landing
-                m.chain = 0;
-                g_stats.hitrun++;
-                changed = true;
-            }
-        }
-
-        // ---- 4b. you just got hit: it does not wait, it swings again immediately ----
-        if (!changed && finish && st == St::Ready && dist < (lmode ? cfg::kPressureRangeL : cfg::kPressureRange) + 80.0f &&
-            angle_gap(t, toLink) < 0x4000) {
-            start_attack(t, m, dist);
-            m.chain = 0;
-            g_stats.finish++;
-            changed = true;
-        }
-
-        // ---- 4c. zoning: you walk up to it without swinging; it steps back and strikes as you follow ----
-        if (!changed && lmode && st == St::Ready && g_jumpHook && !linkAtk && m.zoneCd == 0 && m.armed == 0 &&
-            m.prevDist > 0.0f && dist > cfg::kZoneMin && dist < cfg::kZoneMax &&
-            (m.prevDist - dist) > cfg::kZoneApproach && rand01() < cfg::kZoneChance) {
-            if (do_dodge(t, 6, m)) {
-                m.zoneCd = cfg::kZoneCooldown;
-                g_stats.zone++;
-                changed = true;
-            }
-        }
-
-        // ---- 5. pressure: you are in reach and not swinging, so it attacks ----
-        if (!changed && st == St::Ready) {
-            if (t->mTimer3 > cfg::kMaxGameCooldown) {
-                t->mTimer3 = cfg::kMaxGameCooldown;
-            }
-            const bool linkReaching = linkAtk && dist < cfg::kLinkReach;
-            if (py->checkPlayerGuard() && m.atkCd == 0 && m.armed == 0 && dist < cfg::kBreakerRange &&
-                angle_gap(t, toLink) < 0x3800 && rand01() < cfg::kBreakerChance) {
-                // Your shield is up: it kicks it down instead of swinging a sword into it.
-                if (!lmode) {
-                    enter(t, t->mNextBreakPart < 11 ? TN::ACT_ATTACKSHIELDH : TN::ACT_ATTACKH, TN::ACTION2_0_e);
-                } else {
-                    enter(t, TN::ACT_ATTACKSHIELDL, TN::ACTION2_0_e);
-                }
-                m.atkCd = lmode ? cfg::kAttackGapL : cfg::kAttackGapH;
-                m.chainRolled = false;
-                m.speeded = false;
-                g_stats.breaker++;
-                changed = true;
-            } else if (m.atkCd == 0 && m.armed == 0 && (!linkReaching || lmode) &&
-                       dist < (lmode ? cfg::kPressureRangeL : cfg::kPressureRange) && angle_gap(t, toLink) < 0x3800 &&
-                       rand01() < (lmode ? cfg::kPressureChanceL : cfg::kPressureChance) + 0.2f * g_heat) {
-                start_attack(t, m, dist);
-                m.chain = 0;
-                g_stats.pressure++;
-                changed = true;
-            } else if (lmode && g_jumpHook && TnInitChaseL::g_orig != nullptr && m.leapCd == 0 && m.atkCd == 0 &&
-                       m.armed == 0 && dist > cfg::kLeapMin && dist < cfg::kLeapMax &&
-                       angle_gap(t, toLink) < 0x2000 &&
-                       rand01() < cfg::kLeapChance * (ranged ? cfg::kRangedLeapChance : cfg::kLeapIdleL)) {
-                enter(t, TN::ACT_CHASEL, TN::ACTION2_0_e);
-                TnInitChaseL::g_orig(t, dist < 700.0f ? 8 : 17);  // the game's own forward leap
-                m.leapCd = ranged ? cfg::kLeapCooldown / 2 : cfg::kLeapCooldown;
-                g_stats.leap++;
-                changed = true;
-            }
-        }
-
-        // ---- 6. footwork: turn to you quickly, walk and circle faster (absolute speeds, not stacking) ----
-        if (!changed && (st == St::Ready || st == St::Guard) && dist < cfg::kTurnRange && m.expose == 0) {
-            turn_toward(t, toLink, cfg::kTurnStep);
-        }
-        if (!changed && st == St::Ready) {
-            const int m2 = t->mActionMode2;
-            if (!lmode) {
-                if (m2 == TN::ACTION2_9_e && dist > 450.0f) {
-                    t->speedF = ranged ? cfg::kRangedWalkH : cfg::kWalkSpeedH;
-                } else if (m2 == TN::ACTION2_2_e && dist > 320.0f) {
-                    t->speedF = cfg::kApproachSpeedH;
-                }
-            } else {
-                const bool walking = m2 == TN::ACTION2_3_e || m2 == TN::ACTION2_16_e;
-                const bool strafing = m2 == TN::ACTION2_4_e || m2 == TN::ACTION2_5_e;
-                if (!walking) {
-                    m.stutter = 0;  // only the straight approach is broken up; any other state cancels it
-                    m.burst = 0;
-                }
-                if (m.stutter > 0) {
-                    // rhythm breaker, part 1: it stops dead
-                    t->speedF = 0.0f;
-                    if (--m.stutter == 0) {
-                        m.burst = cfg::kBurstTicks;
-                    }
-                } else if (m.burst > 0) {
-                    // part 2: it surges at you
-                    t->speedF = cfg::kBurstSpeedL;
-                    m.burst--;
-                } else if (walking && dist > cfg::kStutterMinDist && dist < cfg::kStutterMaxDist &&
-                           rand01() < cfg::kStutterChance) {
-                    m.stutter = cfg::kStutterMin + static_cast<int>(rand01() * float(cfg::kStutterMax - cfg::kStutterMin + 1));
-                    t->speedF = 0.0f;
-                    g_stats.stutter++;
-                } else if (m2 == TN::ACTION2_3_e && dist > 450.0f) {
-                    t->speedF = cfg::kWalkSpeedL;
-                } else if (m2 == TN::ACTION2_16_e) {
-                    t->speedF = cfg::kWalkSpeedL;
-                } else if (strafing) {
-                    t->speedF = cfg::kStrafeSpeedL;
-                }
-            }
-        }
-
-        // ---- 6b. harder hits (sword damage only; its health is never touched) ----
-        if (st != St::Hurt && st != St::Other) {
-            const int atp = std::max(1, static_cast<int>(std::lround(
-                lmode ? 2.0f * (cfg::kDamageMultL + cfg::kRageDamage * rage_of(t, m)) : 4.0f * cfg::kDamageMultH)));
-            for (int i = 0; i < 4; i++) {
-                t->mSwordSphs[i].SetAtAtp(atp);
-            }
-            t->mCps.SetAtAtp(atp);
-        }
-
-        // ---- 6c. no built-in pauses: the game freezes its swing pose for a moment at the end of each attack; skipped ----
-        if (lmode && st == St::Attack && (t->mActionMode2 == 101 || t->mActionMode2 == 102) && t->mTimer1 > 0) {
-            t->mTimer1 = 0;
-        }
-
-        // ---- 7. faster wind-up, once per swing ----
-        if (st == St::Attack && !m.speeded && !changed && t->mpModelMorf2 != nullptr &&
-            (t->mActionMode2 == 1 || t->mActionMode2 == 2)) {
-            m.speeded = true;
-            const float speedMult = (lmode ? cfg::kAttackSpeedMultL + cfg::kRageAttackSpeed * rage_of(t, m) : cfg::kAttackSpeedMult) +
-                                0.25f * g_heat;
-            // mixed timing: some swings come out extra fast, some half a beat late (the hold below)
-            const float variant = (lmode && rand01() < cfg::kFastSwingChance) ? cfg::kFastSwingMult : 1.0f;
-            t->mpModelMorf2->setPlaySpeed(t->mpModelMorf2->getPlaySpeed() * speedMult * variant);
-            // Bait: sometimes hold the swing back in its wind-up (almost stopped, never exactly 0: the game
-            // treats a rate of exactly 0 as "animation finished").
-            if (!m.holdDone && t->mpModelMorf2->getFrame() < 6.0f &&
-                rand01() < (lmode ? cfg::kHoldChanceL : cfg::kHoldChance)) {
-                m.holdDone = true;
-                m.savedRate = t->mpModelMorf2->getPlaySpeed();
-                const int hMin = lmode ? cfg::kHoldMinL : cfg::kHoldMin;
-                const int hMax = lmode ? cfg::kHoldMaxL : cfg::kHoldMax;
-                m.hold = hMin + static_cast<int>(rand01() * float(hMax - hMin + 1));
-                t->mpModelMorf2->setPlaySpeed(0.05f);
-                g_stats.held++;
-            }
-        } else if (st == St::Attack && m.hold > 0 && t->mpModelMorf2 != nullptr) {
-            if (--m.hold == 0) {
-                t->mpModelMorf2->setPlaySpeed(m.savedRate);
-            }
-        }
-
-        m.prevDist = dist;
-        alive[a] = m;
-    }
-    if (g_readThisTick && engaged >= 2) {
-        for (auto& sp : strikers) {
-            auto ai = alive.find(sp.first);
-            if (ai != alive.end() && classify(sp.first) == St::Ready && rand01() < cfg::kPackChance) {
-                start_attack(sp.first, ai->second, sp.second);
-                g_stats.pack++;
-            }
-        }
-    }
-    g_mem.swap(alive);
-
-    if (engaged > 0 && ++g_statTicks >= cfg::kStatusTicks) {
-        g_statTicks = 0;
-        mods::log::info(
-            "darknut: n={} reads={} guard={} dodge={} cancelled={} opened={} | its attacks: riposte={} pressure={} "
-            "chain={} leap={} counter={} landing={} finish={} zone={} hitrun={} rush={} doubled={} jumpdodge={} | mind games: held={} breaker={} habit={} punish={} pack={} heat={:.2f} rage={:.2f} | your hits landed={} | hooks: hit={} dodge={}",
-            engaged, g_stats.read, g_stats.guard, g_stats.evade, g_stats.negated, g_stats.opening,
-            g_stats.riposte, g_stats.pressure, g_stats.chain, g_stats.leap, g_stats.counter, g_stats.landing, g_stats.finish, g_stats.zone, g_stats.hitrun, g_stats.rush, g_stats.doubled, g_stats.jumpdodge, g_stats.held, g_stats.breaker,
-            g_stats.habit, g_stats.punish, g_stats.pack, g_heat, g_rageSeen, g_stats.landed,
-            g_hitHook ? "ON" : "OFF", g_jumpHook ? "ON" : "OFF");
-        g_stats = Stats{};
-        g_rageSeen = 0.0f;
-    } else if (engaged == 0) {
-        g_statTicks = 0;
-    }
+static void on_post(ModContext*, void* args, void*, void*) {
+    if (g_off) return;
+    e_dn_class* d = mods::arg<e_dn_class*>(args, 0);
+    if (d != nullptr && d->status == 0) after(d);
 }
 
-}  // namespace
+// ---------------------------------------------------------------------------------------------------------------
+// Link tracking, once per frame, before any actor runs.
+static void track_link() {
+    fopAc_ac_c* plrp = player_ptr();
+    if (plrp == nullptr) {
+        g_link.have = false;
+        return;
+    }
+    auto* link = static_cast<daAlink_c*>(plrp);
+    Link& L = g_link;
+    const u16 proc = link->mProcID;
+    if (!L.have) {
+        L.have = true;
+        L.proc = proc;
+        L.type = attack_type_of(proc);
+        L.attacking = L.type != AType::None;
+        return;
+    }
+    const AType type = attack_type_of(proc);
+    const bool changed = proc != L.proc;
+    const double now = now_sec();
+
+    if (changed && type != AType::None) {
+        L.attackSeq++;
+        L.lastType = type;
+        L.lastAttackAt = now;
+        g_moves[g_movesPos] = type;
+        g_movesPos = (g_movesPos + 1) % cfg::kMoveHistory;
+        g_movesN = std::min(g_movesN + 1, cfg::kMoveHistory);
+        // spacing at the moment you commit: distance to the nearest Lizalfos is taken in the brain; here we use
+        // the last one the brain measured
+        g_spaces[g_spacesPos] = static_cast<int>(L.lastDist / cfg::kSpaceBucket);
+        g_spacesPos = (g_spacesPos + 1) % cfg::kSpaceHistory;
+        g_spacesN = std::min(g_spacesN + 1, cfg::kSpaceHistory);
+    }
+    if (L.attacking && type == AType::None) {
+        L.attackEndSeq++;
+    }
+    if (changed && is_roll(proc)) {
+        L.rollSeq++;
+        Dodge dd = Dodge::Front;
+        if (proc == daAlink_c::PROC_SIDE_ROLL) {
+            const s16 d = static_cast<s16>(link->current.angle.y - link->shape_angle.y);
+            dd = d > 0 ? Dodge::Right : Dodge::Left;
+        }
+        L.lastDodge = dd;
+        g_dodges[g_dodgesPos] = dd;
+        g_dodgesPos = (g_dodgesPos + 1) % cfg::kDodgeHistory;
+        g_dodgesN = std::min(g_dodgesN + 1, cfg::kDodgeHistory);
+    }
+    if (changed && (proc == daAlink_c::PROC_BACK_JUMP || proc == daAlink_c::PROC_SIDESTEP)) {
+        L.backSeq++;
+        const Dodge dd = proc == daAlink_c::PROC_BACK_JUMP ? Dodge::Back : Dodge::Left;
+        g_dodges[g_dodgesPos] = dd;
+        g_dodgesPos = (g_dodgesPos + 1) % cfg::kDodgeHistory;
+        g_dodgesN = std::min(g_dodgesN + 1, cfg::kDodgeHistory);
+    }
+    if (changed && is_item(proc)) L.itemSeq++;
+    if (changed && is_charge(proc)) L.chargeSeq++;
+
+    // standing still: no horizontal speed and a waiting move id
+    if ((proc == daAlink_c::PROC_WAIT) && link->speedF < 0.5f) {
+        L.stillFrames++;
+    } else {
+        L.stillFrames = 0;
+    }
+
+    // hearts
+    const int life = life_now();
+    L.maxLife = max_life_now();
+    if (L.life >= 0 && life < L.life) {
+        g_lastLinkHit = now;
+        if (cfg::kEnableChains) {
+            g_burstUntil = now + cfg::kBurstSec;
+            g_st.burst++;
+        }
+    }
+    L.life = life;
+
+    L.proc = proc;
+    L.type = type;
+    L.attacking = type != AType::None;
+}
 
 extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError*) {
-    if (cfg::kUseHitHook) {
-        const ModResult hr = mods::hook::add_pre<AtTgHit>(on_at_tg_hit);
-        g_hitHook = (hr == MOD_OK);
-    }
-    if (cfg::kUseDodgeJumps) {
-        const ModResult jr = mods::hook::install<TnInitChaseL>();
-        g_jumpHook = (jr == MOD_OK) && TnInitChaseL::g_orig != nullptr;
+    g_hooksOk = false;
+    if (svc_hook != nullptr) {
+        const ModResult a = mods::hook::add_pre<DnExecute>(on_pre);
+        const ModResult b = mods::hook::add_post<DnExecute>(on_post);
+        g_hooksOk = (a == MOD_OK && b == MOD_OK);
     }
     mods::log::info(
-        "darknut_ruthless v12 initialized | hit-cancel hook {} | dodge-jump hook {} | status line every 5 s "
-        "near a Darknut{}",
-        cfg::kUseHitHook ? (g_hitHook ? "ON" : "UNAVAILABLE") : "OFF (every hit connects)",
-        g_jumpHook ? "ON" : "UNAVAILABLE",
-        g_jumpHook ? ""
-                   : " | the dodge-jump hook is UNAVAILABLE: your game build has no symbol manifest. Armor-off dodges, "
-                     "leaps, zoning, hit-and-run and landing strikes need it; guarding, counters and chaining still work.");
+        LZ_VERSION " initialized | hooks {} | read {:.0f}% | damage x{:.0f}..x{:.0f} | swing x{:.1f}..x{:.1f} | "
+        "run x{:.1f} | rage {:.0f}% -> {:.0f}% | status line every {:.0f} s",
+        g_hooksOk ? "ON" : "UNAVAILABLE (the mod will do nothing)", cfg::kReadChance * 100.0f, cfg::kDamageMult,
+        cfg::kDamageMultRage, cfg::kSwingSpeed, cfg::kSwingSpeed + cfg::kSwingRageBonus, cfg::kMoveMult,
+        cfg::kRageStart * 100.0f, cfg::kRageAfterHit * 100.0f, cfg::kStatusSec);
+    g_nextStatus = now_sec() + cfg::kStatusSec;
     return MOD_OK;
 }
 
 MOD_EXPORT ModResult mod_update(ModError*) {
-    tick();
+    if (!g_hooksOk || g_off) return MOD_OK;
+    track_link();
+    const double now = now_sec();
+    if (now >= g_nextPrune) {
+        g_nextPrune = now + 2.0;
+        for (auto it = g_mem.begin(); it != g_mem.end();) {
+            it = (now - it->second.lastSeen > cfg::kPruneSec) ? g_mem.erase(it) : std::next(it);
+        }
+    }
+    if (now >= g_nextStatus) {
+        g_nextStatus = now + cfg::kStatusSec;
+        if (now - g_lastEngaged < cfg::kStatusSec * 2) {
+            const Stats& s = g_st;
+            mods::log::info(
+                LZ_VERSION ": liz={} rage={:.0f}% heat={:.0f}% | read ok={} miss={} | shield={} hop={} weak-hop={} "
+                "bait={} | pattern move/dodge/space={}/{}/{} (level {}) | counter={} roll={} backflip={} item={} "
+                "charge={} still={} turtle={} | feint={} cancel={} fake-retreat={} surge={} zone={} | chain={} "
+                "burst={} cut={} shake={} pack={} last-stand-ticks={} | swing-scaled={} dmg-scaled={} | layout={}/{}",
+                g_mem.size(), g_rage * 100.0f, heat_now() * 100.0f, s.read, s.readMiss, s.guard, s.hop, s.weakHop,
+                s.bait, s.pattMove, s.pattDodge, s.pattSpace, pattern_level(), s.counter, s.rollPunish, s.backPunish,
+                s.itemPunish, s.chargePunish, s.stillPunish, s.turtle, s.feint, s.feintCancel, s.fakeRetreat, s.surge,
+                s.zone, s.chain, s.burst, s.cut, s.shake, s.pack, s.lastStand, s.sped, s.scaled, g_good, g_bad);
+            g_st = Stats{};
+        }
+    }
     return MOD_OK;
 }
 
 MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_mem.clear();
-    g_stats = Stats{};
-    g_statTicks = 0;
-    g_tick = 0;
-    g_histCount = 0;
-    g_histHead = 0;
-    reset_link_state();
+    g_link = Link{};
+    g_movesN = g_dodgesN = g_spacesN = 0;
+    g_movesPos = g_dodgesPos = g_spacesPos = 0;
+    for (double& w : g_weakUntil) w = 0.0;
+    for (int& b : g_blocked) b = 0;
+    g_rage = cfg::kRageStart;
+    g_alarmSeq = 0;
+    g_off = false;
+    g_good = g_bad = 0;
+    g_st = Stats{};
     return MOD_OK;
 }
 }
