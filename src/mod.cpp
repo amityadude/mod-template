@@ -347,17 +347,20 @@ void raise_guard(TN* t, const fopAc_ac_c* plr, int ticks) {
     }
 }
 
-void enter_guard_state(TN* t, const fopAc_ac_c* plr) {
+// NEVER force the armor-off sword-guard state (ACT_GUARDL) from here. Its first tick calls the game's
+// getCutType(), which dereferences mAtInfo.mpCollider with no null check. The game only enters that state from
+// inside damage_check, right after it has pointed mpCollider at the thing that hit it; damage_check also resets
+// mpCollider to NULL at the start of every frame, so a state forced from the mod always meets NULL = crash.
+// Armor off therefore just raises the game's own guard flags: the first hit that lands is then blocked by the
+// game's normal path (real sparks, real guard animation, valid collider). Armored is safe (GUARDH never reads it).
+void enter_guard_state(TN* t, const fopAc_ac_c* plr, St st) {
     raise_guard(t, plr, cfg::kArmTicks + 8);
     t->field_0xaa8 = false;
     if (h_mode(t)) {
         enter(t, TN::ACT_GUARDH, TN::ACTION2_0_e);
-    } else {
-        // The armor-off guard animation reads the collider of the last hit; with no hit it would be null.
-        if (t->mAtInfo.mpCollider == nullptr) {
-            t->mAtInfo.mpCollider = &t->mSwordSphs[0];
-        }
-        enter(t, TN::ACT_GUARDL, TN::ACTION2_0_e);
+    } else if (st == St::Attack) {
+        // mid-recovery of its own swing: drop the swing and go back to the guarded chase (turns the sword hitbox off)
+        enter(t, TN::ACT_CHASEL, TN::ACTION2_0_e);
     }
 }
 
@@ -493,7 +496,7 @@ bool try_read(TN* t, Mem& m, const fopAc_ac_c* plr, AType type, St st, float dis
         m.armed = 0;
         return false;
     }
-    enter_guard_state(t, plr);
+    enter_guard_state(t, plr, st);
     g_stats.guard++;
     log_event("read -> guard", t, type, dist);
     return true;
@@ -890,7 +893,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
     const ModResult jr = mods::hook::install<TnInitChaseL>();
     g_jumpHook = (jr == MOD_OK) && TnInitChaseL::g_orig != nullptr;
     mods::log::info(
-        "darknut_ruthless v5 initialized | combo-finisher hook {} | dodge-jump hook {} | status line every 5 s "
+        "darknut_ruthless v6 initialized | combo-finisher hook {} | dodge-jump hook {} | status line every 5 s "
         "near a Darknut{}",
         g_hitHook ? "ON" : "UNAVAILABLE", g_jumpHook ? "ON" : "UNAVAILABLE",
         (g_hitHook && g_jumpHook)
