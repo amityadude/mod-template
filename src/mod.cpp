@@ -1,4 +1,4 @@
-// Darknut Ruthless v11 (agile armor-off duelist; earlier notes below are from v1): makes every Darknut (the Temple of Time mini-boss and the Hyrule Castle ones) read
+// Darknut Ruthless v12 (agile armor-off duelist, 7 more tactics; earlier notes below are from v1): makes every Darknut (the Temple of Time mini-boss and the Hyrule Castle ones) read
 // your attacks, block or dodge them, and punish every miss. Nothing else in the game is touched, and the
 // Darknut's health is never changed (it keeps its normal armor-break / damage rules).
 //
@@ -66,7 +66,15 @@ constexpr float kYorokeCancelFrame = 4.0f;  // your jump strike / 4th hit stagge
 constexpr float kYorokeDodge = 0.5f;        // ... and then dodges aside (else it swings straight back)
 constexpr float kHitRunChance = 0.6f;       // after its swing it jumps aside instead of standing in your counter
 constexpr float kHoldChanceL = 0.2f;        // armor-off wind-up holds (fewer: this is a fast fight)
-constexpr int kHoldMinL = 2, kHoldMaxL = 5;
+constexpr int kHoldMinL = 4, kHoldMaxL = 8;   // a half-beat delay, 0.13-0.27 s
+// ---- v12 ----
+constexpr float kFastSwingChance = 0.4f;    // mixed timing: this share of its swings come out extra fast ...
+constexpr float kFastSwingMult = 1.3f;      // ... at this extra speed
+constexpr int kDoubleDodgeTicks = 25;       // you attack again within this long after it dodged: it dodges again
+constexpr float kRollRush = 0.85f;          // you rolled / backflipped out of reach: it leaps in and swings
+constexpr float kChargeRush = 0.5f;         // per tick while you charge a spin from a distance
+constexpr float kChargePunishL = 0.7f;      // per tick while you charge a spin in its reach (armor off)
+constexpr int kFlurryChain = 3;             // at full rage: extra swings in one burst, then it jumps away
 constexpr float kPressureChanceL = 0.9f;
 constexpr float kPressureRangeL = 480.0f;
 constexpr float kStunCancelFrameL = 5.0f;   // armor-off: it shakes off a hit after this many animation frames (was 12)
@@ -209,11 +217,12 @@ struct Mem {
     float prevDist = -1.0f;
     int stutter = 0;
     int burst = 0;
+    int sinceDodge = 1000;  // ticks since it last dodged
 };
 
 struct Stats {
     int read = 0, guard = 0, evade = 0, negated = 0, landed = 0, riposte = 0, pressure = 0, chain = 0,
-        leap = 0, opening = 0, breaker = 0, held = 0, habit = 0, punish = 0, pack = 0, counter = 0, landing = 0, finish = 0, zone = 0, stutter = 0, hitrun = 0;
+        leap = 0, opening = 0, breaker = 0, held = 0, habit = 0, punish = 0, pack = 0, counter = 0, landing = 0, finish = 0, zone = 0, stutter = 0, hitrun = 0, rush = 0, doubled = 0, jumpdodge = 0;
 };
 
 std::unordered_map<const void*, Mem> g_mem;
@@ -326,10 +335,10 @@ bool in_recovery(const TN* t) {
         }
     } else if (t->mActionMode1 == TN::ACT_ATTACKL) {
         if (m2 == 1 || m2 == 101) {
-            return f >= 16.0f;
+            return f >= 14.5f;  // the sword hitbox turns off at frame 14
         }
         if (m2 == 2 || m2 == 102) {
-            return f >= 40.0f;
+            return f >= 38.5f;  // ... at frame 38
         }
     }
     return false;
@@ -438,8 +447,19 @@ void enter_guard_state(TN* t, const fopAc_ac_c* plr, St st) {
     }
 }
 
+// Blind-side jump: away from the side you usually dodge toward (code 10 = its negative side, 13 = positive side).
+int pick_side(const Mem& m) {
+    if (m.bias >= 2) {
+        return 10;
+    }
+    if (m.bias <= -2) {
+        return 13;
+    }
+    return rand01() < 0.5f ? 10 : 13;
+}
+
 // which: 6 = back-jump, 10 = jump right, 13 = jump left (the game's own dodge jumps)
-bool do_dodge(TN* t, int which) {
+bool do_dodge(TN* t, int which, Mem& m) {
     if (!g_jumpHook || TnInitChaseL::g_orig == nullptr || h_mode(t)) {
         return false;
     }
@@ -448,6 +468,7 @@ bool do_dodge(TN* t, int which) {
     if (which != 6) {
         t->mTimer7 = 10;
     }
+    m.sinceDodge = 0;
     return true;
 }
 
@@ -487,7 +508,13 @@ bool try_read(TN* t, Mem& m, const fopAc_ac_c* plr, AType type, St st, float dis
     }
     // A swing it is holding back in its wind-up is a feint: if you swing into it, it drops the swing and guards.
     const bool recovering = (st == St::Attack) && (in_recovery(t) || m.hold > 0);
-    if (!(st == St::Ready || st == St::Guard || recovering)) {
+    // You attack again right after it dodged, while it is still landing: it dodges AGAIN, so chasing it with combos fails.
+    const int m2now = t->mActionMode2;
+    const bool doubleDodge = !h_mode(t) && g_jumpHook && TnInitChaseL::g_orig != nullptr &&
+                             m.sinceDodge < cfg::kDoubleDodgeTicks && st == St::Other &&
+                             t->mActionMode1 == TN::ACT_CHASEL &&
+                             (m2now == 7 || m2now == 9 || m2now == 12 || m2now == 15);
+    if (!(st == St::Ready || st == St::Guard || recovering || doubleDodge)) {
         return false;
     }
     const bool wide = wide_move(type);
@@ -506,7 +533,9 @@ bool try_read(TN* t, Mem& m, const fopAc_ac_c* plr, AType type, St st, float dis
     if (type == AType::Bash && !canDodge) {
         return false;  // a bash is meant to break its guard: only a dodge makes sense
     }
-    if (rand01() >= read_chance(type, recovering, !h_mode(t))) {
+    // A jump strike is never even rolled for: it just sidesteps it (then punishes the landing).
+    const bool jumpCounter = canDodge && (type == AType::Jump || type == AType::Large);
+    if (!jumpCounter && !doubleDodge && rand01() >= read_chance(type, recovering, !h_mode(t))) {
         return false;
     }
 
@@ -567,20 +596,35 @@ bool try_read(TN* t, Mem& m, const fopAc_ac_c* plr, AType type, St st, float dis
                 side = std::min(0.95f, side + lb);
             }
         }
+        if (jumpCounter) {
+            back = 0.2f;
+            side = 0.8f;
+        }
+        if (doubleDodge) {
+            back = 0.35f;
+            side = 0.65f;
+        }
         const float r = rand01();
         if (r < back) {
-            if (do_dodge(t, 6)) {
+            if (do_dodge(t, 6, m)) {
                 g_stats.evade++;
+                g_stats.jumpdodge += jumpCounter ? 1 : 0;
+                g_stats.doubled += doubleDodge ? 1 : 0;
                 log_event("read -> back-jump", t, type, dist);
                 return true;
             }
         } else if (r < back + side) {
-            if (do_dodge(t, rand01() < 0.5f ? 10 : 13)) {
+            if (do_dodge(t, pick_side(m), m)) {
                 g_stats.evade++;
+                g_stats.jumpdodge += jumpCounter ? 1 : 0;
+                g_stats.doubled += doubleDodge ? 1 : 0;
                 log_event("read -> side-jump", t, type, dist);
                 return true;
             }
         }
+    }
+    if (doubleDodge) {
+        return false;  // no dodge this time: it never guards from the middle of a landing
     }
     if (type == AType::Bash) {
         m.armed = 0;
@@ -765,6 +809,7 @@ void tick() {
         if (m.atkCd > 0) m.atkCd--;
         if (m.leapCd > 0) m.leapCd--;
         if (m.zoneCd > 0) m.zoneCd--;
+        if (m.sinceDodge < 1000) m.sinceDodge++;
         if (m.streak > 0 && ++m.streakAge > cfg::kStreakForget) {
             m.streak = 0;
             m.streakAge = 0;
@@ -808,7 +853,7 @@ void tick() {
         }
         // Recovered from the stagger: it jumps aside (agile) or swings straight back.
         if (yorokeOff && lmode && rand01() < cfg::kYorokeDodge &&
-            do_dodge(t, rand01() < 0.5f ? 10 : 13)) {
+            do_dodge(t, pick_side(m), m)) {
             g_stats.evade++;
             changed = true;
         }
@@ -925,10 +970,21 @@ void tick() {
             }
         }
 
+        // ---- 3a. you rolled / backflipped out of reach, or charge a spin from afar: it leaps in and swings on landing ----
+        if (!changed && st == St::Ready && lmode && g_jumpHook && TnInitChaseL::g_orig != nullptr && m.leapCd == 0 &&
+            dist > cfg::kRiposteRange * 0.8f && dist < 800.0f && angle_gap(t, toLink) < 0x4000 &&
+            ((rollStart && rand01() < cfg::kRollRush) || (charging && rand01() < cfg::kChargeRush))) {
+            enter(t, TN::ACT_CHASEL, TN::ACTION2_0_e);
+            TnInitChaseL::g_orig(t, dist < 700.0f ? 8 : 17);  // the game's own forward leap
+            m.leapCd = cfg::kLeapCooldown / 2;
+            g_stats.rush++;
+            changed = true;
+        }
+
         // ---- 3b. punish a roll / backflip, and interrupt a spin charge (both phases) ----
         if (!changed && st == St::Ready && dist < cfg::kRiposteRange && angle_gap(t, toLink) < 0x4000) {
             if ((rollStart && rand01() < cfg::kPunishChance) ||
-                (charging && dist < 350.0f && rand01() < cfg::kChargePunish)) {
+                (charging && dist < 350.0f && rand01() < (lmode ? cfg::kChargePunishL : cfg::kChargePunish))) {
                 start_attack(t, m, dist);
                 g_stats.punish++;
                 changed = true;
@@ -938,16 +994,17 @@ void tick() {
         // ---- 4. chain: swing again without waiting out its recovery ----
         if (!changed && st == St::Attack && m.armed == 0 && in_recovery(t) && !m.chainRolled) {
             m.chainRolled = true;
+            const bool full = lmode && rage_of(t, m) >= 0.99f;  // full rage: a flurry
             const int chainMax = (lmode ? cfg::kChainMaxL + int(cfg::kRageChain * rage_of(t, m)) : cfg::kChainMax) +
-                                 (finish ? cfg::kFinishChain : 0);
+                                 (finish ? cfg::kFinishChain : 0) + (full ? cfg::kFlurryChain : 0);
             if (m.chain < chainMax && dist < cfg::kChainRange && angle_gap(t, toLink) < 0x3800 &&
                 (finish || rand01() < cfg::kChainChance)) {
                 m.chain++;
                 start_attack(t, m, dist);
                 g_stats.chain++;
                 changed = true;
-            } else if (lmode && !finish && rand01() < cfg::kHitRunChance &&
-                       do_dodge(t, rand01() < 0.5f ? 10 : 13)) {
+            } else if (lmode && !finish && rand01() < (full ? 1.0f : cfg::kHitRunChance) &&
+                       do_dodge(t, pick_side(m), m)) {
                 // chain over: instead of standing in your counter it jumps aside, then strikes again on landing
                 m.chain = 0;
                 g_stats.hitrun++;
@@ -968,7 +1025,7 @@ void tick() {
         if (!changed && lmode && st == St::Ready && g_jumpHook && !linkAtk && m.zoneCd == 0 && m.armed == 0 &&
             m.prevDist > 0.0f && dist > cfg::kZoneMin && dist < cfg::kZoneMax &&
             (m.prevDist - dist) > cfg::kZoneApproach && rand01() < cfg::kZoneChance) {
-            if (do_dodge(t, 6)) {
+            if (do_dodge(t, 6, m)) {
                 m.zoneCd = cfg::kZoneCooldown;
                 g_stats.zone++;
                 changed = true;
@@ -1067,13 +1124,20 @@ void tick() {
             t->mCps.SetAtAtp(atp);
         }
 
+        // ---- 6c. no built-in pauses: the game freezes its swing pose for a moment at the end of each attack; skipped ----
+        if (lmode && st == St::Attack && (t->mActionMode2 == 101 || t->mActionMode2 == 102) && t->mTimer1 > 0) {
+            t->mTimer1 = 0;
+        }
+
         // ---- 7. faster wind-up, once per swing ----
         if (st == St::Attack && !m.speeded && !changed && t->mpModelMorf2 != nullptr &&
             (t->mActionMode2 == 1 || t->mActionMode2 == 2)) {
             m.speeded = true;
             const float speedMult = (lmode ? cfg::kAttackSpeedMultL + cfg::kRageAttackSpeed * rage_of(t, m) : cfg::kAttackSpeedMult) +
                                 0.25f * g_heat;
-            t->mpModelMorf2->setPlaySpeed(t->mpModelMorf2->getPlaySpeed() * speedMult);
+            // mixed timing: some swings come out extra fast, some half a beat late (the hold below)
+            const float variant = (lmode && rand01() < cfg::kFastSwingChance) ? cfg::kFastSwingMult : 1.0f;
+            t->mpModelMorf2->setPlaySpeed(t->mpModelMorf2->getPlaySpeed() * speedMult * variant);
             // Bait: sometimes hold the swing back in its wind-up (almost stopped, never exactly 0: the game
             // treats a rate of exactly 0 as "animation finished").
             if (!m.holdDone && t->mpModelMorf2->getFrame() < 6.0f &&
@@ -1110,9 +1174,9 @@ void tick() {
         g_statTicks = 0;
         mods::log::info(
             "darknut: n={} reads={} guard={} dodge={} cancelled={} opened={} | its attacks: riposte={} pressure={} "
-            "chain={} leap={} counter={} landing={} finish={} zone={} hitrun={} | mind games: held={} breaker={} habit={} punish={} pack={} heat={:.2f} rage={:.2f} | your hits landed={} | hooks: hit={} dodge={}",
+            "chain={} leap={} counter={} landing={} finish={} zone={} hitrun={} rush={} doubled={} jumpdodge={} | mind games: held={} breaker={} habit={} punish={} pack={} heat={:.2f} rage={:.2f} | your hits landed={} | hooks: hit={} dodge={}",
             engaged, g_stats.read, g_stats.guard, g_stats.evade, g_stats.negated, g_stats.opening,
-            g_stats.riposte, g_stats.pressure, g_stats.chain, g_stats.leap, g_stats.counter, g_stats.landing, g_stats.finish, g_stats.zone, g_stats.hitrun, g_stats.held, g_stats.breaker,
+            g_stats.riposte, g_stats.pressure, g_stats.chain, g_stats.leap, g_stats.counter, g_stats.landing, g_stats.finish, g_stats.zone, g_stats.hitrun, g_stats.rush, g_stats.doubled, g_stats.jumpdodge, g_stats.held, g_stats.breaker,
             g_stats.habit, g_stats.punish, g_stats.pack, g_heat, g_rageSeen, g_stats.landed,
             g_hitHook ? "ON" : "OFF", g_jumpHook ? "ON" : "OFF");
         g_stats = Stats{};
@@ -1135,7 +1199,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         g_jumpHook = (jr == MOD_OK) && TnInitChaseL::g_orig != nullptr;
     }
     mods::log::info(
-        "darknut_ruthless v11 initialized | hit-cancel hook {} | dodge-jump hook {} | status line every 5 s "
+        "darknut_ruthless v12 initialized | hit-cancel hook {} | dodge-jump hook {} | status line every 5 s "
         "near a Darknut{}",
         cfg::kUseHitHook ? (g_hitHook ? "ON" : "UNAVAILABLE") : "OFF (every hit connects)",
         g_jumpHook ? "ON" : "UNAVAILABLE",
