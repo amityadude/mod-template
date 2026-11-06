@@ -58,6 +58,24 @@ constexpr int kArmTicks = 24;               // how long a read keeps the guard u
 constexpr int kStreakMax = 6;               // reads in a row before it drops its guard
 constexpr int kStreakMaxL = 9;            // armor-off Darknut: reads in a row before it drops its guard
 constexpr float kStunCancelFrameL = 12.0f;  // armor-off: it shakes off a hit after this many animation frames
+// ---- v4: mind games ----
+constexpr float kHoldChance = 0.7f;         // chance a swing is held back in its wind-up (so you cannot time a dodge)
+constexpr int kHoldMin = 3;                 // ticks (0.1 s)
+constexpr int kHoldMax = 12;                // ticks (0.4 s)
+constexpr float kBreakerChance = 0.45f;     // per tick while you hold your shield up and it is in kick range
+constexpr float kBreakerRange = 230.0f;
+constexpr float kHabitShare = 0.6f;         // this share of your last 12 moves being the same = "you are repeating"
+constexpr int kHabitMinSamples = 6;
+constexpr int kHotTicks = 60;
+constexpr float kPunishChance = 0.85f;      // it strikes the moment you roll / backflip near it (both phases)
+constexpr float kChargePunish = 0.25f;      // per tick while you charge a spin attack near it
+constexpr int kBiasMax = 4;                 // how well it learns which way you dodge
+constexpr int kBiasAge = 120;
+constexpr int kBiasTurn = 0x1200;           // it aims its swing this far toward your favourite dodge side
+constexpr float kHeatSeconds = 30.0f;       // time without being hit that gives full pressure
+constexpr float kPackChance = 0.85f;        // a second Darknut swings the moment the first one guards your attack
+constexpr float kRangedLeapChance = 0.7f;   // leap-in chance (x0.1 per tick) while you use bow/boomerang/hookshot
+constexpr float kRangedWalkH = 11.5f;
 constexpr int kStreakForget = 150;          // ticks without a read before the streak resets
 constexpr int kExposeTicks = 24;            // your opening after kStreakMax reads (1.2 s)
 // ---- Dodging (armor-off Darknut; needs the dodge-jump hook) ----
@@ -128,11 +146,17 @@ struct Mem {
     bool speeded = false;
     bool lastHurt = false;
     bool seen = false;
+    int hold = 0;
+    float savedRate = 1.0f;
+    bool holdDone = false;
+    int hot = 0;          // you are repeating a move: it counters harder
+    int bias = 0;         // + = you dodge toward its yaw-positive side, - = the other
+    int biasAge = 0;
 };
 
 struct Stats {
     int read = 0, guard = 0, evade = 0, negated = 0, landed = 0, riposte = 0, pressure = 0, chain = 0,
-        leap = 0, opening = 0;
+        leap = 0, opening = 0, breaker = 0, held = 0, habit = 0, punish = 0, pack = 0;
 };
 
 std::unordered_map<const void*, Mem> g_mem;
@@ -142,6 +166,9 @@ int g_tick = 0;
 int g_logBudget = 80;
 bool g_hitHook = false;
 bool g_jumpHook = false;
+bool g_readThisTick = false;
+int g_sinceLanded = 0;
+float g_heat = 0.0f;
 
 // Link's attack bookkeeping
 u16 g_prevProc = 0;
@@ -355,10 +382,14 @@ void start_attack(TN* t, Mem& m, float dist) {
     } else {
         enter(t, dist < 200.0f ? TN::ACT_ATTACKSHIELDL : TN::ACT_ATTACKL, TN::ACTION2_0_e);
     }
-    m.atkCd = h_mode(t) ? cfg::kAttackGapH : cfg::kAttackGapL;
+    m.atkCd = static_cast<int>((h_mode(t) ? cfg::kAttackGapH : cfg::kAttackGapL) * (1.0f - 0.5f * g_heat));
     m.chainRolled = false;
     m.speeded = false;
     m.armed = 0;
+    if (std::abs(m.bias) >= 2) {
+        // you keep dodging to one side: it aims its swing a little that way
+        t->shape_angle.y = static_cast<s16>(t->shape_angle.y + (m.bias > 0 ? cfg::kBiasTurn : -cfg::kBiasTurn));
+    }
 }
 
 float read_chance(AType t, bool recovering) {
@@ -398,6 +429,13 @@ bool try_read(TN* t, Mem& m, const fopAc_ac_c* plr, AType type, St st, float dis
         return false;
     }
 
+    const bool repeating =
+        g_histCount >= cfg::kHabitMinSamples && habit_share(type) >= cfg::kHabitShare;
+    if (repeating) {
+        m.hot = cfg::kHotTicks;
+        g_stats.habit++;
+    }
+    g_readThisTick = true;
     m.readCd = cfg::kReadCooldown;
     m.streakAge = 0;
     m.riposteTry = 0;
@@ -423,6 +461,18 @@ bool try_read(TN* t, Mem& m, const fopAc_ac_c* plr, AType type, St st, float dis
         case AType::Head: side = cfg::kEvadeSideHead; break;
         case AType::Bash: back = cfg::kEvadeBackBash; break;
         default: break;
+        }
+        if (repeating) {
+            if (type == AType::Head) {
+                back = 0.0f;
+                side = 0.85f;
+            } else if (type == AType::Slash) {
+                back = 0.45f;
+                side = 0.40f;
+            } else {
+                back = 0.85f;
+                side = 0.0f;
+            }
         }
         const float r = rand01();
         if (r < back) {
@@ -528,6 +578,23 @@ void tick() {
         g_sinceAtkStart = 0;
         remember_attack(startType);
     }
+    const bool rollStart = (proc == daAlink_c::PROC_FRONT_ROLL || proc == daAlink_c::PROC_SIDE_ROLL ||
+                            proc == daAlink_c::PROC_BACK_JUMP) && proc != g_prevProc;
+    const bool charging = py->checkCutCharge();
+    const bool ranged = proc == daAlink_c::PROC_BOW_MOVE || proc == daAlink_c::PROC_BOW_SUBJECT ||
+                        proc == daAlink_c::PROC_BOOMERANG_MOVE || proc == daAlink_c::PROC_BOOMERANG_SUBJECT ||
+                        proc == daAlink_c::PROC_HOOKSHOT_MOVE || proc == daAlink_c::PROC_HOOKSHOT_SUBJECT;
+    {
+        // pressure: long without being hit, or you are low on hearts
+        const auto& sa = g_dComIfG_gameInfo.info.getPlayer().getPlayerStatusA();
+        const float maxLife = std::max<float>(1.0f, sa.getMaxLife());
+        const float lifeRatio = clampf(sa.getLife() / maxLife, 0.0f, 1.0f);
+        g_sinceLanded++;
+        g_heat = clampf(std::min(1.0f, g_sinceLanded / (cfg::kHeatSeconds * 30.0f)) * 0.6f +
+                            std::max(0.0f, 0.5f - lifeRatio) * 1.2f,
+                        0.0f, 1.0f);
+    }
+    g_readThisTick = false;
     const bool attackEnd = !linkAtk && g_prevLinkAtk;
     if (attackEnd) {
         g_sinceAtkEnd = 0;
@@ -544,6 +611,7 @@ void tick() {
     fopAcIt_Executor(collect_tn, &all);
 
     std::unordered_map<const void*, Mem> alive;
+    std::vector<std::pair<TN*, float>> strikers;
     int engaged = 0;
     for (fopAc_ac_c* a : all) {
         const float dist = dist_xz(a, plr);
@@ -575,6 +643,7 @@ void tick() {
             m.expose--;
         }
         if (m.readCd > 0) m.readCd--;
+        if (m.hot > 0) m.hot--;
         if (m.atkCd > 0) m.atkCd--;
         if (m.leapCd > 0) m.leapCd--;
         if (m.streak > 0 && ++m.streakAge > cfg::kStreakForget) {
@@ -598,6 +667,7 @@ void tick() {
         const bool hurt = (st == St::Hurt);
         if (hurt && !m.lastHurt) {
             g_stats.landed++;
+            g_sinceLanded = 0;
             m.streak = 0;
             m.armed = 0;
             m.expose = 0;
@@ -607,6 +677,8 @@ void tick() {
         if (st == St::Attack) {
             m.chainAge = 0;
         } else {
+            m.holdDone = false;
+            m.hold = 0;
             m.speeded = false;     // the game started its next swing by itself: boost that one too
             m.chainRolled = false;
             if (++m.chainAge > 40) {
@@ -614,11 +686,28 @@ void tick() {
             }
         }
 
+        if (rollStart) {
+            const s16 rel = static_cast<s16>(plr->current.angle.y - toLink);
+            const float side = std::sin(rel * kAngleToRad);
+            if (std::abs(side) > 0.4f) {
+                m.bias = std::clamp(m.bias + (side > 0.0f ? 1 : -1), -cfg::kBiasMax, cfg::kBiasMax);
+                m.biasAge = 0;
+            }
+        }
+        if (m.bias != 0 && ++m.biasAge > cfg::kBiasAge) {
+            m.bias += (m.bias > 0 ? -1 : 1);
+            m.biasAge = 0;
+        }
+
         // ---- 1. read the move you just started ----
         if (attackStart) {
             if (try_read(t, m, plr, startType, st, dist, fx, fz)) {
                 changed = true;
             }
+        }
+
+        if (attackStart && !changed && st == St::Ready && dist < cfg::kRiposteRange) {
+            strikers.emplace_back(t, dist);  // did not read it: a pack mate may swing while you are committed
         }
 
         // ---- 2. keep the read going: face you, guard from every angle; or open up after the streak ----
@@ -632,8 +721,8 @@ void tick() {
         }
 
         // ---- 3. riposte: your swing just ended ----
-        if (attackEnd && dist < cfg::kRiposteRange && rand01() < cfg::kRiposteChance) {
-            m.riposteIn = cfg::kRiposteDelay;
+        if (attackEnd && dist < cfg::kRiposteRange && rand01() < (m.hot > 0 ? 1.0f : cfg::kRiposteChance)) {
+            m.riposteIn = m.hot > 0 ? 1 : cfg::kRiposteDelay;
             m.riposteTry = 0;
         }
         if (m.riposteIn > 0 && --m.riposteIn == 0) {
@@ -649,6 +738,16 @@ void tick() {
                 start_attack(t, m, dist);
                 g_stats.riposte++;
                 m.riposteTry = 0;
+                changed = true;
+            }
+        }
+
+        // ---- 3b. punish a roll / backflip, and interrupt a spin charge (both phases) ----
+        if (!changed && st == St::Ready && dist < cfg::kRiposteRange && angle_gap(t, toLink) < 0x4000) {
+            if ((rollStart && rand01() < cfg::kPunishChance) ||
+                (charging && dist < 350.0f && rand01() < cfg::kChargePunish)) {
+                start_attack(t, m, dist);
+                g_stats.punish++;
                 changed = true;
             }
         }
@@ -671,18 +770,32 @@ void tick() {
                 t->mTimer3 = cfg::kMaxGameCooldown;
             }
             const bool linkReaching = linkAtk && dist < cfg::kLinkReach;
-            if (m.atkCd == 0 && m.armed == 0 && !linkReaching && dist < cfg::kPressureRange &&
-                angle_gap(t, toLink) < 0x3800 && rand01() < cfg::kPressureChance) {
+            if (py->checkPlayerGuard() && m.atkCd == 0 && m.armed == 0 && dist < cfg::kBreakerRange &&
+                angle_gap(t, toLink) < 0x3800 && rand01() < cfg::kBreakerChance) {
+                // Your shield is up: it kicks it down instead of swinging a sword into it.
+                if (!lmode) {
+                    enter(t, t->mNextBreakPart < 11 ? TN::ACT_ATTACKSHIELDH : TN::ACT_ATTACKH, TN::ACTION2_0_e);
+                } else {
+                    enter(t, TN::ACT_ATTACKSHIELDL, TN::ACTION2_0_e);
+                }
+                m.atkCd = lmode ? cfg::kAttackGapL : cfg::kAttackGapH;
+                m.chainRolled = false;
+                m.speeded = false;
+                g_stats.breaker++;
+                changed = true;
+            } else if (m.atkCd == 0 && m.armed == 0 && !linkReaching && dist < cfg::kPressureRange &&
+                angle_gap(t, toLink) < 0x3800 && rand01() < cfg::kPressureChance + 0.2f * g_heat) {
                 start_attack(t, m, dist);
                 m.chain = 0;
                 g_stats.pressure++;
                 changed = true;
             } else if (lmode && g_jumpHook && TnInitChaseL::g_orig != nullptr && m.leapCd == 0 && m.atkCd == 0 &&
                        m.armed == 0 && dist > cfg::kLeapMin && dist < cfg::kLeapMax &&
-                       angle_gap(t, toLink) < 0x2000 && rand01() < cfg::kLeapChance * 0.1f) {
+                       angle_gap(t, toLink) < 0x2000 &&
+                       rand01() < cfg::kLeapChance * (ranged ? cfg::kRangedLeapChance : 0.1f)) {
                 enter(t, TN::ACT_CHASEL, TN::ACTION2_0_e);
                 TnInitChaseL::g_orig(t, dist < 700.0f ? 8 : 17);  // the game's own forward leap
-                m.leapCd = cfg::kLeapCooldown;
+                m.leapCd = ranged ? cfg::kLeapCooldown / 2 : cfg::kLeapCooldown;
                 g_stats.leap++;
                 changed = true;
             }
@@ -696,7 +809,7 @@ void tick() {
             const int m2 = t->mActionMode2;
             if (!lmode) {
                 if (m2 == TN::ACTION2_9_e && dist > 450.0f) {
-                    t->speedF = cfg::kWalkSpeedH;
+                    t->speedF = ranged ? cfg::kRangedWalkH : cfg::kWalkSpeedH;
                 } else if (m2 == TN::ACTION2_2_e && dist > 320.0f) {
                     t->speedF = cfg::kApproachSpeedH;
                 }
@@ -724,10 +837,32 @@ void tick() {
         if (st == St::Attack && !m.speeded && !changed && t->mpModelMorf2 != nullptr &&
             (t->mActionMode2 == 1 || t->mActionMode2 == 2)) {
             m.speeded = true;
-            t->mpModelMorf2->setPlaySpeed(t->mpModelMorf2->getPlaySpeed() * cfg::kAttackSpeedMult);
+            t->mpModelMorf2->setPlaySpeed(t->mpModelMorf2->getPlaySpeed() * (cfg::kAttackSpeedMult + 0.25f * g_heat));
+            // Bait: sometimes hold the swing back in its wind-up (almost stopped, never exactly 0: the game
+            // treats a rate of exactly 0 as "animation finished").
+            if (!m.holdDone && t->mpModelMorf2->getFrame() < 6.0f && rand01() < cfg::kHoldChance) {
+                m.holdDone = true;
+                m.savedRate = t->mpModelMorf2->getPlaySpeed();
+                m.hold = cfg::kHoldMin + static_cast<int>(rand01() * float(cfg::kHoldMax - cfg::kHoldMin + 1));
+                t->mpModelMorf2->setPlaySpeed(0.05f);
+                g_stats.held++;
+            }
+        } else if (st == St::Attack && m.hold > 0 && t->mpModelMorf2 != nullptr) {
+            if (--m.hold == 0) {
+                t->mpModelMorf2->setPlaySpeed(m.savedRate);
+            }
         }
 
         alive[a] = m;
+    }
+    if (g_readThisTick && engaged >= 2) {
+        for (auto& sp : strikers) {
+            auto ai = alive.find(sp.first);
+            if (ai != alive.end() && classify(sp.first) == St::Ready && rand01() < cfg::kPackChance) {
+                start_attack(sp.first, ai->second, sp.second);
+                g_stats.pack++;
+            }
+        }
     }
     g_mem.swap(alive);
 
@@ -735,9 +870,10 @@ void tick() {
         g_statTicks = 0;
         mods::log::info(
             "darknut: n={} reads={} guard={} dodge={} cancelled={} opened={} | its attacks: riposte={} pressure={} "
-            "chain={} leap={} | your hits landed={} | hooks: hit={} dodge={}",
+            "chain={} leap={} | mind games: held={} breaker={} habit={} punish={} pack={} heat={:.2f} | your hits landed={} | hooks: hit={} dodge={}",
             engaged, g_stats.read, g_stats.guard, g_stats.evade, g_stats.negated, g_stats.opening,
-            g_stats.riposte, g_stats.pressure, g_stats.chain, g_stats.leap, g_stats.landed,
+            g_stats.riposte, g_stats.pressure, g_stats.chain, g_stats.leap, g_stats.held, g_stats.breaker,
+            g_stats.habit, g_stats.punish, g_stats.pack, g_heat, g_stats.landed,
             g_hitHook ? "ON" : "OFF", g_jumpHook ? "ON" : "OFF");
         g_stats = Stats{};
     } else if (engaged == 0) {
@@ -754,7 +890,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
     const ModResult jr = mods::hook::install<TnInitChaseL>();
     g_jumpHook = (jr == MOD_OK) && TnInitChaseL::g_orig != nullptr;
     mods::log::info(
-        "darknut_ruthless v3 initialized | combo-finisher hook {} | dodge-jump hook {} | status line every 5 s "
+        "darknut_ruthless v5 initialized | combo-finisher hook {} | dodge-jump hook {} | status line every 5 s "
         "near a Darknut{}",
         g_hitHook ? "ON" : "UNAVAILABLE", g_jumpHook ? "ON" : "UNAVAILABLE",
         (g_hitHook && g_jumpHook)
