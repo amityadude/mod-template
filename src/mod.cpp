@@ -28,7 +28,6 @@
 #include "f_op/f_op_actor_mng.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <unordered_map>
@@ -154,9 +153,13 @@ constexpr s16 NORMAL = 0, FIGHT_RUN = 3, ATTACK_0 = 4, ATTACK = 5, TAIL_ATTACK =
               S_DAMAGE = 20, DAMAGE = 21;
 }
 
-using Clock = std::chrono::steady_clock;
+// Time is counted in game ticks (mod_update runs once per tick, 30 per second), not read from a system clock: the
+// Windows build of <chrono> does not compile together with the game's headers.
+constexpr double kTicksPerSec = 30.0;
+constexpr double kLongAgo = -1000.0;  // "a long time ago" in seconds, so timers start out expired
+static uint32_t g_tick = 0;
 static double now_sec() {
-    return std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+    return static_cast<double>(g_tick) / kTicksPerSec;
 }
 
 static uint32_t g_rng = 0x2F6E2B1u;
@@ -252,7 +255,7 @@ struct Link {
     float lastDist = 0.0f;
     Dodge lastDodge = Dodge::None;
     int stillFrames = 0;
-    double lastAttackAt = 0.0;
+    double lastAttackAt = kLongAgo;
     int life = -1, maxLife = 0;
 };
 static Link g_link;
@@ -290,8 +293,8 @@ static int pattern_level() {
 // ---------------------------------------------------------------------------------------------------------------
 // fight-wide state
 static float g_rage = cfg::kRageStart;
-static double g_lastEngaged = 0.0;
-static double g_lastLinkHit = 0.0;
+static double g_lastEngaged = kLongAgo;
+static double g_lastLinkHit = kLongAgo;
 static double g_burstUntil = 0.0;
 static uint32_t g_alarmSeq = 0;
 static bool g_off = false;       // layout self-check failed
@@ -886,6 +889,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
 
 MOD_EXPORT ModResult mod_update(ModError*) {
     if (!g_hooksOk || g_off) return MOD_OK;
+    g_tick++;
     track_link();
     const double now = now_sec();
     if (now >= g_nextPrune) {
@@ -933,6 +937,10 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     for (double& w : g_weakUntil) w = 0.0;
     for (int& b : g_blocked) b = 0;
     g_rage = cfg::kRageStart;
+    g_tick = 0;
+    g_lastEngaged = kLongAgo;
+    g_lastLinkHit = kLongAgo;
+    g_burstUntil = 0.0;
     g_alarmSeq = 0;
     g_off = false;
     g_good = g_bad = 0;
