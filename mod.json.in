@@ -1,7 +1,7 @@
-{
-  "id": "com.example.my_mod",
-  "name": "My Mod",
-  "version": "@PROJECT_VERSION@",
-  "author": "You",
-  "description": "An example Dusklight mod"
-}
+   {
+     "id": "com.amityadude.lizalfos_nightmare",
+     "name": "Lizalfos Nightmare",
+     "version": "@PROJECT_VERSION@",
+     "author": "Amityadude",
+     "description": "Brutally hard Lizalfos"
+   }
