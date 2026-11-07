@@ -898,15 +898,27 @@ MOD_EXPORT ModResult mod_update(ModError*) {
         g_nextStatus = now + cfg::kStatusSec;
         if (now - g_lastEngaged < cfg::kStatusSec * 2) {
             const Stats& s = g_st;
+            // Four short lines instead of one with 35 arguments: fmt checks every format string at compile time,
+            // and MSVC (the Windows build) gives up on very long ones where gcc/clang do not.
             mods::log::info(
-                LZ_VERSION ": liz={} rage={:.0f}% heat={:.0f}% | read ok={} miss={} | shield={} hop={} weak-hop={} "
-                "bait={} | pattern move/dodge/space={}/{}/{} (level {}) | counter={} roll={} backflip={} item={} "
-                "charge={} still={} turtle={} | feint={} cancel={} fake-retreat={} surge={} zone={} | chain={} "
-                "burst={} cut={} shake={} pack={} last-stand-ticks={} | swing-scaled={} dmg-scaled={} | layout={}/{}",
+                LZ_VERSION " [1/4]: liz={} rage={:.0f}% heat={:.0f}% | read ok={} miss={} | shield={} hop={} "
+                "weak-hop={} | layout={}/{}",
                 g_mem.size(), g_rage * 100.0f, heat_now() * 100.0f, s.read, s.readMiss, s.guard, s.hop, s.weakHop,
-                s.bait, s.pattMove, s.pattDodge, s.pattSpace, pattern_level(), s.counter, s.rollPunish, s.backPunish,
-                s.itemPunish, s.chargePunish, s.stillPunish, s.turtle, s.feint, s.feintCancel, s.fakeRetreat, s.surge,
-                s.zone, s.chain, s.burst, s.cut, s.shake, s.pack, s.lastStand, s.sped, s.scaled, g_good, g_bad);
+                g_good, g_bad);
+            mods::log::info(
+                LZ_VERSION " [2/4]: bait={} | pattern move/dodge/space={}/{}/{} (level {}) | counter={} roll={} "
+                "backflip={}",
+                s.bait, s.pattMove, s.pattDodge, s.pattSpace, pattern_level(), s.counter, s.rollPunish,
+                s.backPunish);
+            mods::log::info(
+                LZ_VERSION " [3/4]: item={} charge={} still={} turtle={} | feint={} cancel={} fake-retreat={} "
+                "surge={}",
+                s.itemPunish, s.chargePunish, s.stillPunish, s.turtle, s.feint, s.feintCancel, s.fakeRetreat,
+                s.surge);
+            mods::log::info(
+                LZ_VERSION " [4/4]: zone={} | chain={} burst={} cut={} shake={} pack={} last-stand-ticks={} | "
+                "swing-scaled={} dmg-scaled={}",
+                s.zone, s.chain, s.burst, s.cut, s.shake, s.pack, s.lastStand, s.sped, s.scaled);
             g_st = Stats{};
         }
     }
